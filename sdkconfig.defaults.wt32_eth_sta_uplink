@@ -1,0 +1,11 @@
+# WT32-ETH01: WiFi STA uplink + Ethernet downlink
+# Use with: idf.py -B build_eth_sta -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.wt32_eth_sta_uplink" build
+
+# Ethernet downlink GPIOs (WT32-ETH01 with LAN8720)
+CONFIG_ETH_MDC_GPIO=23
+CONFIG_ETH_MDIO_GPIO=18
+CONFIG_ETH_PHY_ADDR=1
+CONFIG_ETH_PHY_POWER_GPIO=16
+
+# Ethernet driver
+CONFIG_ETH_USE_ESP32_EMAC=y

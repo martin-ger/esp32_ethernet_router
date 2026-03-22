@@ -1,0 +1,2817 @@
+/* Web interface (HTTP server) at 192.168.4.1.
+ *
+ * Pages:
+ *   /          - Status dashboard: connection state, clients, heap, uptime, login
+ *   /config    - Router configuration: AP/STA settings, static IP, MAC addresses
+ *   /mappings  - DHCP reservations and port forwarding management
+ *   /firewall  - ACL firewall rules (4 lists, add/delete, hit statistics)
+ *   /vpn       - WireGuard VPN configuration and status
+ *   /scan      - WiFi network scanner (STA uplink only)
+ *
+ * Password-protected pages use cookie-based sessions (30-min timeout).
+ * HTML templates are defined in pages.h as C macro strings.
+ */
+#include "esp_netif.h"
+#include "lwip/ip_addr.h"
+#include "lwip/inet.h"
+
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <esp_log.h>
+#include <esp_system.h>
+#include <esp_timer.h>
+#include <sys/param.h>
+#include "nvs_flash.h"
+#include "esp_netif.h"
+//#include "esp_eth.h"
+//#include "protocol_examples_common.h"
+
+#include <esp_http_server.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "lwip/lwip_napt.h"
+#include "lwip/sockets.h"
+
+#include "pages.h"
+#include "favicon_png.h"
+#include "router_globals.h"
+#include "pcap_capture.h"
+#include "acl.h"
+#include "remote_console.h"
+#include "cJSON.h"
+#include "esp_ota_ops.h"
+#include "esp_app_format.h"
+#include "esp_app_desc.h"
+
+static const char *TAG = "HTTPServer";
+
+/* Get client IP address string from HTTP request */
+static const char *get_client_ip(httpd_req_t *req, char *buf, size_t buf_len)
+{
+    int sockfd = httpd_req_to_sockfd(req);
+    struct sockaddr_in6 addr6;
+    socklen_t addr_len = sizeof(addr6);
+    if (getpeername(sockfd, (struct sockaddr *)&addr6, &addr_len) == 0) {
+        /* ESP-IDF httpd uses IPv6 sockets; IPv4 clients appear as
+         * ::ffff:x.x.x.x (IPv4-mapped IPv6).  Extract the IPv4 part. */
+        if (addr6.sin6_family == AF_INET6) {
+            struct in_addr ipv4;
+            memcpy(&ipv4, addr6.sin6_addr.s6_addr + 12, 4);
+            inet_ntoa_r(ipv4, buf, buf_len);
+        } else {
+            struct sockaddr_in *addr4 = (struct sockaddr_in *)&addr6;
+            inet_ntoa_r(addr4->sin_addr, buf, buf_len);
+        }
+    } else {
+        strncpy(buf, "unknown", buf_len);
+    }
+    return buf;
+}
+
+static void web_server_start_captive_dns(void);
+
+esp_timer_handle_t restart_timer;
+
+/* Session management for password protection */
+#define MAX_SESSION_TOKEN_LEN 32
+#define SESSION_TIMEOUT_US (30 * 60 * 1000000LL) // 30 minutes
+
+static char current_session_token[MAX_SESSION_TOKEN_LEN + 1] = {0};
+static bool session_active = false;
+static int64_t session_expiry_time = 0;
+
+static void restart_timer_callback(void* arg)
+{
+    ESP_LOGI(TAG, "Restarting now...");
+    esp_restart();
+}
+
+esp_timer_create_args_t restart_timer_args = {
+        .callback = &restart_timer_callback,
+        /* argument specified here will be passed to timer callback function */
+        .arg = (void*) 0,
+        .name = "restart_timer"
+};
+
+/* Session management helper functions */
+
+/* Generate random session token */
+static void generate_session_token(char* token_out, size_t len)
+{
+    const char hex_chars[] = "0123456789abcdef";
+    for (size_t i = 0; i < len - 1; i++) {
+        token_out[i] = hex_chars[esp_random() % 16];
+    }
+    token_out[len - 1] = '\0';
+}
+
+/* Clear session state */
+static void clear_session(void)
+{
+    session_active = false;
+    current_session_token[0] = '\0';
+    session_expiry_time = 0;
+}
+
+/* Password checking uses shared functions from router_globals.h:
+ * is_web_password_set(), verify_web_password(), set_web_password_hashed() */
+
+/* Extract cookie value from request headers */
+static bool get_cookie_value(httpd_req_t *req, const char* cookie_name,
+                              char* value_out, size_t max_len)
+{
+    size_t cookie_header_len = httpd_req_get_hdr_value_len(req, "Cookie");
+    if (cookie_header_len == 0) {
+        return false;
+    }
+
+    char* cookie_header = malloc(cookie_header_len + 1);
+    if (cookie_header == NULL) {
+        return false;
+    }
+
+    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_header, cookie_header_len + 1) != ESP_OK) {
+        free(cookie_header);
+        return false;
+    }
+
+    // Search for the cookie name
+    char search_pattern[64];
+    snprintf(search_pattern, sizeof(search_pattern), "%s=", cookie_name);
+    char* cookie_start = strstr(cookie_header, search_pattern);
+
+    if (cookie_start == NULL) {
+        free(cookie_header);
+        return false;
+    }
+
+    // Move past the "name=" part
+    cookie_start += strlen(search_pattern);
+
+    // Find the end of the cookie value (semicolon or end of string)
+    char* cookie_end = strchr(cookie_start, ';');
+    size_t cookie_len = cookie_end ? (size_t)(cookie_end - cookie_start) : strlen(cookie_start);
+
+    if (cookie_len >= max_len) {
+        cookie_len = max_len - 1;
+    }
+
+    strncpy(value_out, cookie_start, cookie_len);
+    value_out[cookie_len] = '\0';
+
+    free(cookie_header);
+    return true;
+}
+
+/* Check if request has valid session cookie */
+static bool is_authenticated(httpd_req_t *req)
+{
+    // If no session is active, not authenticated
+    if (!session_active) {
+        return false;
+    }
+
+    // Check if session has expired
+    int64_t current_time = esp_timer_get_time();
+    if (current_time > session_expiry_time) {
+        clear_session();
+        return false;
+    }
+
+    // Extract session cookie
+    char session_token[MAX_SESSION_TOKEN_LEN + 1];
+    if (!get_cookie_value(req, "session", session_token, sizeof(session_token))) {
+        return false;
+    }
+
+    // Validate token matches
+    if (strcmp(session_token, current_session_token) != 0) {
+        return false;
+    }
+
+    // Extend session expiry on successful auth
+    session_expiry_time = current_time + SESSION_TIMEOUT_US;
+
+    return true;
+}
+
+/* Cookie header buffer - must be static because httpd_resp_set_hdr stores pointer, not copy */
+static char session_cookie_header[128];
+
+/* Create new session and set cookie */
+static esp_err_t create_session(httpd_req_t *req)
+{
+    // Generate new session token
+    generate_session_token(current_session_token, sizeof(current_session_token));
+
+    // Set session active and expiry
+    session_active = true;
+    session_expiry_time = esp_timer_get_time() + SESSION_TIMEOUT_US;
+
+    // Set cookie in response (using static buffer because httpd stores pointer)
+    snprintf(session_cookie_header, sizeof(session_cookie_header),
+             "session=%s; Path=/; SameSite=Strict", current_session_token);
+    httpd_resp_set_hdr(req, "Set-Cookie", session_cookie_header);
+
+    ESP_LOGI(TAG, "Session created, expires in 30 minutes");
+    return ESP_OK;
+}
+
+/* --- Config Export/Import helpers --- */
+
+#define CONFIG_IMPORT_MAX_SIZE 8192
+
+static char *bytes_to_hex(const uint8_t *src, size_t len)
+{
+    char *hex = malloc(len * 2 + 1);
+    if (!hex) return NULL;
+    for (size_t i = 0; i < len; i++) {
+        sprintf(hex + i * 2, "%02x", src[i]);
+    }
+    hex[len * 2] = '\0';
+    return hex;
+}
+
+static int hex_to_bytes(const char *src, uint8_t *dst, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        unsigned int byte;
+        if (sscanf(src + i * 2, "%2x", &byte) != 1) return -1;
+        dst[i] = (uint8_t)byte;
+    }
+    return 0;
+}
+
+static char *nvs_export_to_json_robust(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) return NULL;
+
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) { nvs_close(nvs); return NULL; }
+
+    nvs_iterator_t it = NULL;
+    err = nvs_entry_find_in_handle(nvs, NVS_TYPE_ANY, &it);
+    while (err == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+
+        // Skip WireGuard secrets for security
+        if (strcmp(info.key, "vpn_privkey") == 0 || strcmp(info.key, "vpn_psk") == 0) {
+            err = nvs_entry_next(&it);
+            continue;
+        }
+
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "key", info.key);
+        cJSON_AddNumberToObject(item, "type", info.type);
+
+        switch (info.type) {
+            case NVS_TYPE_U8: {
+                uint8_t v; nvs_get_u8(nvs, info.key, &v);
+                cJSON_AddNumberToObject(item, "val", v);
+                break;
+            }
+            case NVS_TYPE_U16: {
+                uint16_t v; nvs_get_u16(nvs, info.key, &v);
+                cJSON_AddNumberToObject(item, "val", v);
+                break;
+            }
+            case NVS_TYPE_U32: {
+                uint32_t v; nvs_get_u32(nvs, info.key, &v);
+                cJSON_AddNumberToObject(item, "val", v);
+                break;
+            }
+            case NVS_TYPE_I32: {
+                int32_t v; nvs_get_i32(nvs, info.key, &v);
+                cJSON_AddNumberToObject(item, "val", v);
+                break;
+            }
+            case NVS_TYPE_STR: {
+                size_t len = 0;
+                nvs_get_str(nvs, info.key, NULL, &len);
+                char *buf = malloc(len);
+                if (buf) {
+                    nvs_get_str(nvs, info.key, buf, &len);
+                    cJSON_AddStringToObject(item, "val", buf);
+                    free(buf);
+                }
+                break;
+            }
+            case NVS_TYPE_BLOB: {
+                size_t len = 0;
+                nvs_get_blob(nvs, info.key, NULL, &len);
+                uint8_t *buf = malloc(len);
+                if (buf) {
+                    nvs_get_blob(nvs, info.key, buf, &len);
+                    char *hex = bytes_to_hex(buf, len);
+                    free(buf);
+                    if (hex) {
+                        cJSON_AddStringToObject(item, "val", hex);
+                        free(hex);
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        cJSON_AddItemToArray(arr, item);
+        err = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    nvs_close(nvs);
+
+    char *json = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    return json;
+}
+
+static esp_err_t nvs_import_from_json_robust(const char *json_str)
+{
+    cJSON *arr = cJSON_Parse(json_str);
+    if (!arr || !cJSON_IsArray(arr)) {
+        cJSON_Delete(arr);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Validate all entries before touching NVS */
+    int valid_count = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, arr) {
+        cJSON *jkey = cJSON_GetObjectItem(item, "key");
+        cJSON *jtype = cJSON_GetObjectItem(item, "type");
+        cJSON *jval = cJSON_GetObjectItem(item, "val");
+        if (!jkey || !cJSON_IsString(jkey) || !jtype || !cJSON_IsNumber(jtype) || !jval) continue;
+        valid_count++;
+    }
+    if (valid_count == 0) {
+        cJSON_Delete(arr);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) { cJSON_Delete(arr); return err; }
+
+    /* Erase all existing keys — safe now that JSON is validated */
+    nvs_erase_all(nvs);
+
+    cJSON_ArrayForEach(item, arr) {
+        cJSON *jkey = cJSON_GetObjectItem(item, "key");
+        cJSON *jtype = cJSON_GetObjectItem(item, "type");
+        cJSON *jval = cJSON_GetObjectItem(item, "val");
+        if (!jkey || !cJSON_IsString(jkey) || !jtype || !cJSON_IsNumber(jtype) || !jval) continue;
+
+        const char *key = jkey->valuestring;
+        int type = (int)jtype->valuedouble;
+
+        switch (type) {
+            case NVS_TYPE_U8:
+                if (cJSON_IsNumber(jval)) nvs_set_u8(nvs, key, (uint8_t)jval->valuedouble);
+                break;
+            case NVS_TYPE_U16:
+                if (cJSON_IsNumber(jval)) nvs_set_u16(nvs, key, (uint16_t)jval->valuedouble);
+                break;
+            case NVS_TYPE_U32:
+                if (cJSON_IsNumber(jval)) nvs_set_u32(nvs, key, (uint32_t)jval->valuedouble);
+                break;
+            case NVS_TYPE_I32:
+                if (cJSON_IsNumber(jval)) nvs_set_i32(nvs, key, (int32_t)jval->valuedouble);
+                break;
+            case NVS_TYPE_STR:
+                if (cJSON_IsString(jval)) nvs_set_str(nvs, key, jval->valuestring);
+                break;
+            case NVS_TYPE_BLOB: {
+                if (!cJSON_IsString(jval)) break;
+                size_t hex_len = strlen(jval->valuestring);
+                if (hex_len % 2 != 0) break;
+                size_t blob_len = hex_len / 2;
+                uint8_t *blob = malloc(blob_len);
+                if (blob) {
+                    if (hex_to_bytes(jval->valuestring, blob, blob_len) == 0) {
+                        nvs_set_blob(nvs, key, blob, blob_len);
+                    }
+                    free(blob);
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    cJSON_Delete(arr);
+    return ESP_OK;
+}
+
+/* Resume STA connection attempts if a WiFi scan had suppressed them.
+ * Called from non-scan page handlers so that navigating away from /scan
+ * (or any other page load) restarts the connection process. */
+static inline void resume_sta_if_scan_idle(void)
+{
+    if (wifi_scan_active) {
+        wifi_scan_active = false;
+        if (!ap_connect) {
+            esp_wifi_connect();
+        }
+    }
+}
+
+/* --- Config Export/Import HTTP handlers --- */
+
+static esp_err_t config_export_handler(httpd_req_t *req)
+{
+    bool password_protection_enabled = is_web_password_set();
+    if (password_protection_enabled && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /api/config-export from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/?auth_required=1");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    char *json = nvs_export_to_json_robust();
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Export failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"esp32_nat_config.json\"");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t config_import_handler(httpd_req_t *req)
+{
+    bool password_protection_enabled = is_web_password_set();
+    if (password_protection_enabled && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /api/config-import from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not authenticated");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len > CONFIG_IMPORT_MAX_SIZE || req->content_len == 0) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Invalid body size\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char *body = malloc(req->content_len + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+
+    int total = 0;
+    while (total < req->content_len) {
+        int ret = httpd_req_recv(req, body + total, req->content_len - total);
+        if (ret <= 0) {
+            free(body);
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                httpd_resp_send_408(req);
+            }
+            return ESP_FAIL;
+        }
+        total += ret;
+    }
+    body[total] = '\0';
+
+    esp_err_t err = nvs_import_from_json_robust(body);
+    free(body);
+
+    httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK) {
+        httpd_resp_send(req, "{\"ok\":true,\"msg\":\"Config imported. Rebooting...\"}", HTTPD_RESP_USE_STRLEN);
+        esp_timer_start_once(restart_timer, 3000000);
+    } else {
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Import failed: invalid JSON\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    return ESP_OK;
+}
+
+static httpd_uri_t config_exportp = {
+    .uri       = "/api/config-export",
+    .method    = HTTP_GET,
+    .handler   = config_export_handler,
+};
+
+static httpd_uri_t config_importp = {
+    .uri       = "/api/config-import",
+    .method    = HTTP_POST,
+    .handler   = config_import_handler,
+};
+
+/* --- OTA Firmware Upload handler --- */
+
+static esp_err_t ota_upload_handler(httpd_req_t *req)
+{
+    bool password_protection_enabled = is_web_password_set();
+    if (password_protection_enabled && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /api/ota-upload from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not authenticated");
+        return ESP_FAIL;
+    }
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"No OTA partition found\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (req->content_len == 0) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Empty request\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (req->content_len > update_partition->size) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Firmware too large for partition\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "OTA upload: %d bytes -> partition '%s' at 0x%lx",
+             req->content_len, update_partition->label, (unsigned long)update_partition->address);
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"OTA begin failed\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char *buf = malloc(4096);
+    if (buf == NULL) {
+        esp_ota_abort(ota_handle);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+
+    int remaining = req->content_len;
+    bool header_checked = false;
+
+    while (remaining > 0) {
+        int recv_len = httpd_req_recv(req, buf, MIN(remaining, 4096));
+        if (recv_len <= 0) {
+            free(buf);
+            esp_ota_abort(ota_handle);
+            if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+                httpd_resp_send_408(req);
+            }
+            return ESP_FAIL;
+        }
+
+        /* Validate firmware header on first chunk */
+        if (!header_checked) {
+            if (recv_len < (int)sizeof(esp_image_header_t)) {
+                free(buf);
+                esp_ota_abort(ota_handle);
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_send(req, "{\"ok\":false,\"msg\":\"File too small to be firmware\"}", HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+            esp_image_header_t *hdr = (esp_image_header_t *)buf;
+            if (hdr->magic != ESP_IMAGE_HEADER_MAGIC) {
+                free(buf);
+                esp_ota_abort(ota_handle);
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Invalid firmware file (bad magic)\"}", HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+            if (hdr->chip_id != CONFIG_IDF_FIRMWARE_CHIP_ID) {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                    "{\"ok\":false,\"msg\":\"Wrong chip type (firmware: 0x%04X, this device: 0x%04X)\"}",
+                    hdr->chip_id, CONFIG_IDF_FIRMWARE_CHIP_ID);
+                free(buf);
+                esp_ota_abort(ota_handle);
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+            header_checked = true;
+        }
+
+        err = esp_ota_write(ota_handle, buf, recv_len);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+            free(buf);
+            esp_ota_abort(ota_handle);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, "{\"ok\":false,\"msg\":\"OTA write failed\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+
+        remaining -= recv_len;
+    }
+
+    free(buf);
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "{\"ok\":false,\"msg\":\"Firmware validation failed: %s\"}",
+            esp_err_to_name(err));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Failed to set boot partition\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "OTA update successful, rebooting in 3 seconds...");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true,\"msg\":\"Firmware updated! Rebooting...\"}", HTTPD_RESP_USE_STRLEN);
+
+    esp_timer_start_once(restart_timer, 3000000);
+    return ESP_OK;
+}
+
+static httpd_uri_t ota_uploadp = {
+    .uri       = "/api/ota-upload",
+    .method    = HTTP_POST,
+    .handler   = ota_upload_handler,
+};
+
+esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
+{
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Page not found");
+    return ESP_FAIL;
+}
+
+char* html_escape(const char* src) {
+    //Primitive html attribue escape, should handle most common issues.
+    int len = strlen(src);
+    //Every char in the string + a null
+    int esc_len = len + 1;
+
+    for (int i = 0; i < len; i++) {
+        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';') {
+            //Will be replaced with a 5 char sequence
+            esc_len += 4;
+        }
+    }
+
+    char* res = malloc(sizeof(char) * esc_len);
+    if (res == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for HTML escaping");
+        return NULL;
+    }
+
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';') {
+            res[j++] = '&';
+            res[j++] = '#';
+            res[j++] = '0' + (src[i] / 10);
+            res[j++] = '0' + (src[i] % 10);
+            res[j++] = ';';
+        }
+        else {
+            res[j++] = src[i];
+        }
+    }
+    res[j] = '\0';
+
+    return res;
+}
+
+static esp_err_t favicon_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "image/png");
+    httpd_resp_send(req, (const char*)favicon_png, favicon_png_len);
+    return ESP_OK;
+}
+
+static const httpd_uri_t favicon_uri = {
+    .uri       = "/favicon.png",
+    .method    = HTTP_GET,
+    .handler   = favicon_get_handler,
+    .user_ctx  = NULL
+};
+
+/* Index page GET handler - System Status with navigation */
+static esp_err_t index_get_handler(httpd_req_t *req)
+{
+    resume_sta_if_scan_idle();
+    char* buf = NULL;
+    size_t buf_len = 0;
+    char param[128];
+    char param2[128];
+    char login_message[256] = "";
+    bool authenticated = false;
+    bool password_protection_enabled = is_web_password_set();
+
+    /* Get query string if any */
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = malloc(buf_len);
+        if (buf != NULL && httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+
+            /* Handle logout */
+            if (httpd_query_key_value(buf, "logout", param, sizeof(param)) == ESP_OK) {
+                clear_session();
+                strcpy(login_message, "Logged out successfully.");
+            }
+
+            /* Handle login */
+            else if (httpd_query_key_value(buf, "login_password", param, sizeof(param)) == ESP_OK) {
+                preprocess_string(param);
+                if (password_protection_enabled && verify_web_password(param)) {
+                    create_session(req);
+                    { char _ip[16]; ESP_LOGI(TAG, "Web UI login successful from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+                    free(buf);
+                    /* Redirect to reload page with session cookie */
+                    httpd_resp_set_status(req, "303 See Other");
+                    httpd_resp_set_hdr(req, "Location", "/");
+                    httpd_resp_send(req, NULL, 0);
+                    return ESP_OK;
+                } else {
+                    char ip[16];
+                    ESP_LOGW(TAG, "Web UI login failed: incorrect password from %s", get_client_ip(req, ip, sizeof(ip)));
+                    strcpy(login_message, "ERROR: Incorrect password.");
+                }
+            }
+
+            /* Handle password change */
+            else if (httpd_query_key_value(buf, "new_password", param, sizeof(param)) == ESP_OK &&
+                     httpd_query_key_value(buf, "confirm_password", param2, sizeof(param2)) == ESP_OK) {
+                preprocess_string(param);
+                preprocess_string(param2);
+
+                // Check if user is authenticated or no password is currently set
+                if (is_authenticated(req) || !password_protection_enabled) {
+                    if (strcmp(param, param2) == 0) {
+                        esp_err_t err = set_web_password_hashed(param);
+                        if (err == ESP_OK) {
+                            clear_session();  // Force re-login with new password
+                            free(buf);
+                            /* Redirect to reload page */
+                            httpd_resp_set_status(req, "303 See Other");
+                            httpd_resp_set_hdr(req, "Location", "/");
+                            httpd_resp_send(req, NULL, 0);
+                            return ESP_OK;
+                        } else {
+                            strcpy(login_message, "ERROR: Failed to save password.");
+                        }
+                    } else {
+                        strcpy(login_message, "ERROR: Passwords do not match.");
+                    }
+                } else {
+                    char ip2[16];
+                    ESP_LOGW(TAG, "Unauthorized attempt to change web password from %s", get_client_ip(req, ip2, sizeof(ip2)));
+                    strcpy(login_message, "ERROR: Not authorized to change password.");
+                }
+            }
+
+            /* Check for auth_required flag */
+            else if (httpd_query_key_value(buf, "auth_required", param, sizeof(param)) == ESP_OK) {
+                strcpy(login_message, "Please log in to access that page.");
+            }
+        }
+        if (buf) free(buf);
+    }
+
+    /* Check current authentication status */
+    authenticated = is_authenticated(req);
+
+    /* Reusable buffer for building dynamic content */
+    char row[512];
+
+    /* --- Begin chunked response --- */
+    httpd_resp_send_chunk(req, INDEX_CHUNK_HEAD, HTTPD_RESP_USE_STRLEN);
+
+    /* Stream logout button if authenticated */
+    if (authenticated) {
+        httpd_resp_send_chunk(req,
+            "<div style='text-align: right; margin-bottom: 0.5rem;'>"
+            "<a href='/?logout=1' style='padding: 0.4rem 1rem; background: rgba(255,82,82,0.15); color: #ff5252; border: 1px solid #ff5252; border-radius: 6px; text-decoration: none; font-size: 0.85rem; font-weight: 500;'>Logout</a>"
+            "</div>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Open status table */
+    httpd_resp_send_chunk(req, INDEX_CHUNK_STATUS_OPEN, HTTPD_RESP_USE_STRLEN);
+
+    /* Stream Uplink SSID row */
+    char* safe_ssid_idx = html_escape(ssid);
+    if (safe_ssid_idx == NULL) safe_ssid_idx = strdup("(not configured)");
+    snprintf(row, sizeof(row), "<tr><td>Uplink SSID:</td><td><strong>%s</strong></td></tr>",
+             safe_ssid_idx[0] ? safe_ssid_idx : "(not configured)");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+    free(safe_ssid_idx);
+
+    /* Stream Uplink IP row */
+    if (ap_connect) {
+        esp_ip4_addr_t addr;
+        addr.addr = my_ip;
+        snprintf(row, sizeof(row), "<tr><td>Uplink IP:</td><td>" IPSTR "</td></tr>", IP2STR(&addr));
+    } else {
+        snprintf(row, sizeof(row), "<tr><td>Uplink IP:</td><td>N/A</td></tr>");
+    }
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    /* Stream Uplink Signal row */
+    if (ap_connect) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            snprintf(row, sizeof(row), "<tr><td>Uplink Signal:</td><td><strong>Connected (%d dBm)</strong></td></tr>", ap_info.rssi);
+            httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+        } else {
+            httpd_resp_send_chunk(req, "<tr><td>Uplink Signal:</td><td><strong>Connected</strong></td></tr>", HTTPD_RESP_USE_STRLEN);
+        }
+    } else {
+        httpd_resp_send_chunk(req, "<tr><td>Uplink Signal:</td><td><strong>Disconnected</strong></td></tr>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Stream Ethernet IP row */
+    esp_ip4_addr_t ap_addr;
+    ap_addr.addr = my_ap_ip;
+    snprintf(row, sizeof(row), "<tr><td>Ethernet IP:</td><td>" IPSTR "</td></tr>", IP2STR(&ap_addr));
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    /* Stream VPN status row (only if enabled) */
+    if (vpn_enabled) {
+        if (vpn_is_connected()) {
+            snprintf(row, sizeof(row), "<tr><td>VPN Status:</td><td><span style='color: #4caf50;'>Connected</span></td></tr>");
+        } else if (vpn_connected) {
+            snprintf(row, sizeof(row), "<tr><td>VPN Status:</td><td><span style='color: #ffc107;'>Handshake Pending</span></td></tr>");
+        } else {
+            snprintf(row, sizeof(row), "<tr><td>VPN Status:</td><td><span style='color: #f44336;'>Disconnected</span></td></tr>");
+        }
+        httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Stream Monitoring row (only if active) */
+    pcap_capture_mode_t mode = pcap_get_mode();
+    if (mode != PCAP_MODE_OFF) {
+        const char* mode_name = (mode == PCAP_MODE_ACL_MONITOR) ? "ACL Monitor" : "Promiscuous";
+        snprintf(row, sizeof(row),
+                 "<tr><td>Monitoring:</td><td><span style='color: #4caf50;'>%s</span> (%lu captured, %lu dropped)</td></tr>",
+                 mode_name,
+                 (unsigned long)pcap_get_captured_count(),
+                 (unsigned long)pcap_get_dropped_count());
+        httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Stream Bytes row */
+    uint64_t bytes_sent = get_sta_bytes_sent();
+    uint64_t bytes_received = get_sta_bytes_received();
+    float sent_mb = bytes_sent / (1024.0 * 1024.0);
+    float received_mb = bytes_received / (1024.0 * 1024.0);
+    snprintf(row, sizeof(row), "<tr><td>Bytes:</td><td>%.1f MB sent / %.1f MB received</td></tr>", sent_mb, received_mb);
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    /* Stream Uptime row */
+    char uptime_str[32];
+    format_uptime(get_uptime_seconds(), uptime_str, sizeof(uptime_str));
+    char boot_time_str[32];
+    format_boot_time(boot_time_str, sizeof(boot_time_str));
+    snprintf(row, sizeof(row), "<tr><td>Uptime:</td><td>%s (since %s)</td></tr>", uptime_str, boot_time_str);
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    /* Close status table */
+    httpd_resp_send_chunk(req, INDEX_CHUNK_STATUS_CLOSE, HTTPD_RESP_USE_STRLEN);
+
+    /* Navigation buttons */
+    httpd_resp_send_chunk(req, INDEX_CHUNK_BUTTONS_OPEN, HTTPD_RESP_USE_STRLEN);
+    if (eth_dhcps_enabled || eth_nat_enabled) {
+        httpd_resp_send_chunk(req, "<a href='/mappings' class='nav-button'>🔀 Mappings</a>", HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_send_chunk(req, INDEX_CHUNK_BUTTONS_CLOSE, HTTPD_RESP_USE_STRLEN);
+
+    /* --- Auth UI Section (streamed directly) --- */
+
+    /* Show message if any */
+    if (login_message[0] != '\0') {
+        const char* msg_style;
+        if (strstr(login_message, "ERROR") != NULL) {
+            msg_style = "background: #ffebee; color: #c62828; border: 2px solid #ef5350";
+        } else {
+            msg_style = "background: #e8f5e9; color: #2e7d32; border: 2px solid #66bb6a";
+        }
+        snprintf(row, sizeof(row),
+                 "<div style='margin-top: 1.5rem; padding: 1rem; %s; border-radius: 8px; font-size: 0.95rem;'>%s</div>",
+                 msg_style, login_message);
+        httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Show warning if no password protection */
+    if (!password_protection_enabled) {
+        httpd_resp_send_chunk(req,
+            "<div style='margin-top: 1.5rem; padding: 1rem; background: #fff3cd; border: 2px solid #ffa726; border-radius: 8px;'>"
+            "<strong style='color: #f57c00;'>⚠ No Password Protection</strong>"
+            "<p style='margin-top: 0.5rem; color: #666; font-size: 0.9rem;'>Anyone on this network can access router settings. Set a password below.</p>"
+            "</div>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Show login form if password is set and not authenticated */
+    if (password_protection_enabled && !authenticated) {
+        httpd_resp_send_chunk(req,
+            "<div style='margin-top: 1.5rem; padding: 1.5rem; background: rgba(16, 32, 16, 0.6); border: 1px solid rgba(0, 230, 118, 0.2); border-radius: 12px;'>"
+            "<h2 style='margin-top: 0; margin-bottom: 1rem; color: #00e676; font-size: 1.1rem;'>🔒 Login Required</h2>"
+            "<form action='' method='GET'>"
+            "<input type='password' name='login_password' placeholder='Enter password' style='width: 100%; padding: 0.75rem; margin-bottom: 0.75rem; background: rgba(255,255,255,0.1); border: 1px solid rgba(0,217,255,0.3); border-radius: 8px; color: #e0e0e0; font-size: 1rem;'/>"
+            "<input type='submit' value='Login' style='width: 100%; padding: 0.75rem; background: linear-gradient(135deg, #43a047 0%, #2e7d32 100%); color: #fff; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer;'/>"
+            "</form>"
+            "</div>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Show password management form if authenticated or no password set */
+    if (authenticated || !password_protection_enabled) {
+        const char* form_title = password_protection_enabled ? "Change Password" : "Set Password";
+        httpd_resp_send_chunk(req,
+            "<div style='margin-top: 1.5rem; padding: 1.5rem; background: rgba(16, 32, 16, 0.6); border: 1px solid rgba(0, 230, 118, 0.2); border-radius: 12px;'>"
+            "<h2 style='margin-top: 0; margin-bottom: 1rem; color: #00e676; font-size: 1.1rem;'>🔑 ", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(req, form_title, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(req,
+            "</h2>"
+            "<form action='' method='GET'>"
+            "<input type='password' name='new_password' placeholder='New password (empty to disable)' style='width: 100%; padding: 0.75rem; margin-bottom: 0.75rem; background: rgba(255,255,255,0.1); border: 1px solid rgba(0,217,255,0.3); border-radius: 8px; color: #e0e0e0; font-size: 1rem;'/>"
+            "<input type='password' name='confirm_password' placeholder='Confirm password' style='width: 100%; padding: 0.75rem; margin-bottom: 0.75rem; background: rgba(255,255,255,0.1); border: 1px solid rgba(0,217,255,0.3); border-radius: 8px; color: #e0e0e0; font-size: 1rem;'/>"
+            "<input type='submit' value='", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(req, form_title, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(req,
+            "' style='width: 100%; padding: 0.75rem; background: linear-gradient(135deg, #e57373 0%, #f5576c 100%); color: #fff; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer;'/>"
+            "<p style='margin-top: 0.75rem; color: #888; font-size: 0.85rem;'>Leave empty to disable password protection.</p>"
+            "</form>"
+            "</div>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Footer */
+    {
+        const esp_app_desc_t *app_desc = esp_app_get_description();
+        char footer[512];
+        snprintf(footer, sizeof(footer), INDEX_CHUNK_TAIL,
+                 app_desc ? app_desc->version : "unknown",
+                 app_desc ? app_desc->date : "",
+                 app_desc ? app_desc->time : "");
+        httpd_resp_send_chunk(req, footer, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* End chunked response */
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    return ESP_OK;
+}
+
+static httpd_uri_t indexp = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = index_get_handler,
+};
+
+/* Router Config page GET handler */
+static esp_err_t config_get_handler(httpd_req_t *req)
+{
+    resume_sta_if_scan_idle();
+    /* Check authentication if password protection is enabled */
+    bool password_protection_enabled = is_web_password_set();
+
+    if (password_protection_enabled && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /config from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        /* Redirect to index page with auth_required flag */
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/?auth_required=1");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    char*  buf;
+    size_t buf_len;
+
+    /* Read URL query string length and allocate memory for length + 1 */
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = malloc(buf_len);
+        if (buf == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate memory for query string");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            return ESP_ERR_NO_MEM;
+        }
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            ESP_LOGI(TAG, "Found URL query => %s", buf);
+            char reset_param[16];
+            if (httpd_query_key_value(buf, "reset", reset_param, sizeof(reset_param)) == ESP_OK) {
+                esp_timer_start_once(restart_timer, 500000);
+            }
+
+            /* Handle disable interface button */
+            if (strstr(buf, "disable_interface=") != NULL) {
+                ESP_LOGI(TAG, "Disabling web interface");
+                if (set_config_param_str("web_disabled", "1") == ESP_OK) {
+                    ESP_LOGI(TAG, "Web interface disabled. Use 'enable' command via serial to re-enable.");
+                }
+                esp_timer_start_once(restart_timer, 500000);
+            }
+
+            char param1[64];
+            char param2[64];
+            char param3[64];
+            char param4[64];
+            char param5[64];
+
+            /* Handle downlink subnet settings (ap_ip, ap_dns) */
+            if (httpd_query_key_value(buf, "ap_ip_addr", param3, sizeof(param3)) == ESP_OK && strlen(param3) > 0) {
+                ESP_LOGI(TAG, "Found URL query parameter => ap_ip_addr=%s", param3);
+                preprocess_string(param3);
+                char* ip_argv[2];
+                ip_argv[0] = "set_ap_ip";
+                ip_argv[1] = param3;
+                set_ap_ip(2, ip_argv);
+
+                // Check for optional DNS server
+                {
+                    char dns_param[64];
+                    if (httpd_query_key_value(buf, "ap_dns", dns_param, sizeof(dns_param)) == ESP_OK) {
+                        preprocess_string(dns_param);
+                        ESP_LOGI(TAG, "Found URL query parameter => ap_dns=%s", dns_param);
+                        set_config_param_str("ap_dns", dns_param);
+                        free(ap_dns);
+                        ap_dns = strdup(dns_param);
+                    }
+                }
+
+                // Check for NAT setting
+                {
+                    char nat_param[8];
+                    if (httpd_query_key_value(buf, "eth_nat", nat_param, sizeof(nat_param)) == ESP_OK) {
+                        int nat_val = atoi(nat_param);
+                        set_config_param_int("eth_nat", nat_val);
+                        eth_nat_enabled = (nat_val != 0) ? 1 : 0;
+                        ESP_LOGI(TAG, "Ethernet NAT %s", eth_nat_enabled ? "enabled" : "disabled");
+                    }
+                }
+
+                // Check for DHCP server setting
+                {
+                    char dhcps_param[8];
+                    if (httpd_query_key_value(buf, "eth_dhcps", dhcps_param, sizeof(dhcps_param)) == ESP_OK) {
+                        int dhcps_val = atoi(dhcps_param);
+                        set_config_param_int("eth_dhcps", dhcps_val);
+                        eth_dhcps_enabled = (dhcps_val != 0) ? 1 : 0;
+                        ESP_LOGI(TAG, "Ethernet DHCP server %s", eth_dhcps_enabled ? "enabled" : "disabled");
+                    }
+                }
+
+                esp_timer_start_once(restart_timer, 500000);
+            }
+
+            /* Handle STA settings with optional MAC */
+            if (httpd_query_key_value(buf, "ssid", param1, sizeof(param1)) == ESP_OK) {
+                ESP_LOGI(TAG, "Found URL query parameter => ssid=%s", param1);
+                preprocess_string(param1);
+                if (httpd_query_key_value(buf, "password", param2, sizeof(param2)) == ESP_OK) {
+                    preprocess_string(param2);
+
+                    // Keep existing password if field was left empty
+                    if (strlen(param2) == 0) {
+                        strlcpy(param2, passwd, sizeof(param2));
+                    }
+                    if (httpd_query_key_value(buf, "ent_username", param3, sizeof(param3)) == ESP_OK) {
+                        ESP_LOGI(TAG, "Found URL query parameter => ent_username=%s", param3);
+                        preprocess_string(param3);
+                        if (httpd_query_key_value(buf, "ent_identity", param4, sizeof(param4)) == ESP_OK) {
+                            ESP_LOGI(TAG, "Found URL query parameter => ent_identity=%s", param4);
+                            preprocess_string(param4);
+
+                            int argc = 0;
+                            char* argv[7];
+                            argv[argc++] = "set_sta";
+                            //SSID
+                            argv[argc++] = param1;
+                            //Password
+                            argv[argc++] = param2;
+                            //Username
+                            if(strlen(param3)) {
+                                argv[argc++] = "-u";
+                                argv[argc++] = param3;
+                            }
+                            //Identity
+                            if(strlen(param4)) {
+                                argv[argc++] = "-a";
+                                argv[argc++] = param4;
+                            }
+
+                            set_sta(argc, argv);
+
+                            // Save WPA2-Enterprise settings to NVS
+                            {
+                                char eap_param[4] = "";
+                                int eap_val = 0;
+                                if (httpd_query_key_value(buf, "eap_method", eap_param, sizeof(eap_param)) == ESP_OK) {
+                                    eap_val = atoi(eap_param);
+                                }
+                                set_config_param_int("eap_method", eap_val);
+                                eap_method = eap_val;
+
+                                char phase2_param[4] = "";
+                                int phase2_val = 0;
+                                if (httpd_query_key_value(buf, "ttls_phase2", phase2_param, sizeof(phase2_param)) == ESP_OK) {
+                                    phase2_val = atoi(phase2_param);
+                                }
+                                set_config_param_int("ttls_phase2", phase2_val);
+                                ttls_phase2 = phase2_val;
+
+                                // Checkboxes: present = 1, absent = 0
+                                char cb_param[4] = "";
+                                int cb_val = 0;
+                                if (httpd_query_key_value(buf, "cert_bundle", cb_param, sizeof(cb_param)) == ESP_OK) {
+                                    cb_val = 1;
+                                }
+                                set_config_param_int("cert_bundle", cb_val);
+                                use_cert_bundle = cb_val;
+
+                                int tc_val = 0;
+                                if (httpd_query_key_value(buf, "no_time_chk", cb_param, sizeof(cb_param)) == ESP_OK) {
+                                    tc_val = 1;
+                                }
+                                set_config_param_int("no_time_chk", tc_val);
+                                disable_time_check = tc_val;
+                            }
+
+                            // Check for optional STA MAC address
+                            if (httpd_query_key_value(buf, "sta_mac", param5, sizeof(param5)) == ESP_OK && strlen(param5) > 0) {
+                                ESP_LOGI(TAG, "Found URL query parameter => sta_mac=%s", param5);
+                                preprocess_string(param5);
+                                // Parse MAC address string (format: AA:BB:CC:DD:EE:FF)
+                                unsigned int mac[6];
+                                if (sscanf(param5, "%02x:%02x:%02x:%02x:%02x:%02x",
+                                           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+                                    char mac_str[6][4];
+                                    for (int i = 0; i < 6; i++) {
+                                        sprintf(mac_str[i], "%d", mac[i]);
+                                    }
+                                    char* mac_argv[7];
+                                    mac_argv[0] = "set_sta_mac";
+                                    for (int i = 0; i < 6; i++) {
+                                        mac_argv[i+1] = mac_str[i];
+                                    }
+                                    set_sta_mac(7, mac_argv);
+                                }
+                            }
+
+                            esp_timer_start_once(restart_timer, 500000);
+                        }
+                    }
+                }
+            }
+
+            /* Handle static IP settings */
+            if (httpd_query_key_value(buf, "staticip", param1, sizeof(param1)) == ESP_OK) {
+                ESP_LOGI(TAG, "Found URL query parameter => staticip=%s", param1);
+                preprocess_string(param1);
+                if (httpd_query_key_value(buf, "subnetmask", param2, sizeof(param2)) == ESP_OK) {
+                    ESP_LOGI(TAG, "Found URL query parameter => subnetmask=%s", param2);
+                    preprocess_string(param2);
+                    if (httpd_query_key_value(buf, "gateway", param3, sizeof(param3)) == ESP_OK) {
+                        ESP_LOGI(TAG, "Found URL query parameter => gateway=%s", param3);
+                        preprocess_string(param3);
+                        int argc = 4;
+                        char* argv[4];
+                        argv[0] = "set_sta_static";
+                        argv[1] = param1;
+                        argv[2] = param2;
+                        argv[3] = param3;
+                        set_sta_static(argc, argv);
+                        esp_timer_start_once(restart_timer, 500000);
+                    }
+                }
+            }
+
+            /* Handle Remote Console settings (single form) */
+            if (httpd_query_key_value(buf, "rc_save", param1, sizeof(param1)) == ESP_OK) {
+                /* Enable/disable */
+                if (httpd_query_key_value(buf, "rc_enabled", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    if (strcmp(param1, "1") == 0) {
+                        remote_console_enable();
+                    } else {
+                        remote_console_disable();
+                    }
+                }
+                /* Port */
+                if (httpd_query_key_value(buf, "rc_port", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    int port = atoi(param1);
+                    if (port >= 1 && port <= 65535) {
+                        remote_console_set_port((uint16_t)port);
+                    }
+                }
+                /* Bind interfaces (checkboxes: absent = unchecked) */
+                uint8_t bind = 0;
+                if (httpd_query_key_value(buf, "rc_bind_ap", param1, sizeof(param1)) == ESP_OK) bind |= RC_BIND_AP;
+                if (httpd_query_key_value(buf, "rc_bind_sta", param1, sizeof(param1)) == ESP_OK) bind |= RC_BIND_STA;
+                if (httpd_query_key_value(buf, "rc_bind_vpn", param1, sizeof(param1)) == ESP_OK) bind |= RC_BIND_VPN;
+                if (bind == 0) bind = RC_BIND_AP;
+                remote_console_set_bind(bind);
+                /* Timeout */
+                if (httpd_query_key_value(buf, "rc_timeout", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    int timeout = atoi(param1);
+                    if (timeout >= 0) {
+                        remote_console_set_timeout((uint32_t)timeout);
+                    }
+                }
+                ESP_LOGI(TAG, "Remote console settings saved via web");
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/config");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
+
+            /* Handle Remote Console kick */
+            if (httpd_query_key_value(buf, "rc_kick", param1, sizeof(param1)) == ESP_OK) {
+                remote_console_kick();
+                ESP_LOGI(TAG, "Remote console session kicked via web");
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/config");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
+
+            /* Handle PCAP settings (single form) */
+            if (httpd_query_key_value(buf, "pcap_save", param1, sizeof(param1)) == ESP_OK) {
+                if (httpd_query_key_value(buf, "pcap_mode", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    if (strcmp(param1, "off") == 0) {
+                        pcap_set_mode(PCAP_MODE_OFF);
+                    } else if (strcmp(param1, "acl") == 0) {
+                        pcap_set_mode(PCAP_MODE_ACL_MONITOR);
+                    } else if (strcmp(param1, "promisc") == 0) {
+                        pcap_set_mode(PCAP_MODE_PROMISCUOUS);
+                    }
+                }
+                if (httpd_query_key_value(buf, "pcap_snaplen", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    int snaplen = atoi(param1);
+                    if (snaplen >= 64 && snaplen <= 1600) {
+                        pcap_set_snaplen((uint16_t)snaplen);
+                    }
+                }
+                ESP_LOGI(TAG, "PCAP settings saved via web");
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/config");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
+        }
+        free(buf);
+    }
+
+    /* Check for SSID pre-fill from scan page */
+    char prefill_ssid[64] = "";
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = malloc(buf_len);
+        if (buf != NULL && httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "ssid", prefill_ssid, sizeof(prefill_ssid)) == ESP_OK) {
+                preprocess_string(prefill_ssid);
+                ESP_LOGI(TAG, "Pre-filling SSID from scan: %s", prefill_ssid);
+            }
+        }
+        if (buf) free(buf);
+    }
+
+    /* Escape values for HTML */
+    char* safe_ssid = html_escape(prefill_ssid[0] ? prefill_ssid : ssid);
+    char* safe_ent_username = html_escape(ent_username);
+    char* safe_ent_identity = html_escape(ent_identity);
+
+    // Get current downlink IP address
+    char* ap_ip_str = NULL;
+    get_config_param_str("ap_ip", &ap_ip_str);
+    if (ap_ip_str == NULL) {
+        ap_ip_str = malloc(16);
+        if (ap_ip_str != NULL) {
+            strcpy(ap_ip_str, "192.168.4.1");
+        }
+    }
+
+    // Check if any html_escape failed
+    if (safe_ssid == NULL ||
+        safe_ent_username == NULL || safe_ent_identity == NULL ||
+        ap_ip_str == NULL) {
+        ESP_LOGE(TAG, "Failed to escape HTML strings");
+        free(safe_ssid);
+        free(safe_ent_username);
+        free(safe_ent_identity);
+        free(ap_ip_str);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Get STA MAC address as string
+    uint8_t mac[6];
+    char sta_mac_str[18] = "";
+    if (esp_wifi_get_mac(ESP_IF_WIFI_STA, mac) == ESP_OK) {
+        sprintf(sta_mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    // Remote Console state
+    remote_console_config_t rc_config;
+    remote_console_status_t rc_status;
+    remote_console_get_config(&rc_config);
+    remote_console_get_status(&rc_status);
+
+    const char* rc_enabled_checked = rc_config.enabled ? "checked" : "";
+    const char* rc_disabled_checked = rc_config.enabled ? "" : "checked";
+
+    const char* rc_status_color;
+    const char* rc_status_text;
+    const char* rc_kick_section = "";
+    char rc_kick_buf[200] = "";
+
+    switch (rc_status.state) {
+        case RC_STATE_DISABLED:
+            rc_status_color = "#888";
+            rc_status_text = "Disabled";
+            break;
+        case RC_STATE_LISTENING:
+            rc_status_color = "#4caf50";
+            rc_status_text = "Listening";
+            break;
+        case RC_STATE_AUTH_WAIT:
+            rc_status_color = "#ffc107";
+            rc_status_text = "Authenticating...";
+            break;
+        case RC_STATE_ACTIVE:
+            rc_status_color = "#00e676";
+            rc_status_text = rc_status.client_ip;
+            snprintf(rc_kick_buf, sizeof(rc_kick_buf),
+                " <a href='/config?rc_kick=1' style='margin-left: 0.5rem; padding: 0.2rem 0.6rem; background: #f44336; color: #fff; border-radius: 4px; text-decoration: none; font-size: 0.8rem;'>Kick</a>");
+            rc_kick_section = rc_kick_buf;
+            break;
+        default:
+            rc_status_color = "#888";
+            rc_status_text = "Unknown";
+            break;
+    }
+
+    const char* rc_ap_chk = (rc_config.bind & RC_BIND_AP) ? "checked" : "";
+    const char* rc_sta_chk = (rc_config.bind & RC_BIND_STA) ? "checked" : "";
+    const char* rc_vpn_chk = (rc_config.bind & RC_BIND_VPN) ? "checked" : "";
+
+    // PCAP state
+    pcap_capture_mode_t pcap_mode = pcap_get_mode();
+    const char* pcap_mode_off_sel = (pcap_mode == PCAP_MODE_OFF) ? "selected" : "";
+    const char* pcap_mode_acl_sel = (pcap_mode == PCAP_MODE_ACL_MONITOR) ? "selected" : "";
+    const char* pcap_mode_promisc_sel = (pcap_mode == PCAP_MODE_PROMISCUOUS) ? "selected" : "";
+    bool pcap_client = pcap_client_connected();
+    const char* pcap_client_color = pcap_client ? "#4caf50" : "#888";
+    const char* pcap_client_text = pcap_client ? "Connected" : "Not connected";
+    uint32_t pcap_captured = pcap_get_captured_count();
+    uint32_t pcap_dropped = pcap_get_dropped_count();
+    int current_snaplen = pcap_get_snaplen();
+
+    /* Reusable buffer for building sections */
+    char section[2048];
+
+    /* --- Begin chunked response --- */
+
+    /* Chunk 1: Page header (styles) */
+    httpd_resp_send_chunk(req, CONFIG_CHUNK_HEAD, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 2: Logout button (if authenticated) */
+    if (session_active && password_protection_enabled) {
+        httpd_resp_send_chunk(req,
+            "<a href='/?logout=1' style='padding: 0.4rem 1rem; background: rgba(255,82,82,0.15); color: #ff5252; border: 1px solid #ff5252; border-radius: 6px; text-decoration: none; font-size: 0.85rem; font-weight: 500;'>Logout</a>",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Chunk 3: JavaScript */
+    httpd_resp_send_chunk(req, CONFIG_CHUNK_SCRIPT, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 4: Ethernet Subnet Settings */
+    snprintf(section, sizeof(section), CONFIG_CHUNK_AP,
+        ap_ip_str, ap_dns ? ap_dns : "",
+        eth_nat_enabled ? "checked" : "",
+        eth_nat_enabled ? "" : "checked",
+        eth_dhcps_enabled ? "checked" : "",
+        eth_dhcps_enabled ? "" : "checked");
+    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 5: STA Settings */
+    snprintf(section, sizeof(section), CONFIG_CHUNK_STA,
+        safe_ssid,
+        safe_ent_username, safe_ent_identity,
+        eap_method == 0 ? "selected" : "", eap_method == 1 ? "selected" : "",
+        eap_method == 2 ? "selected" : "", eap_method == 3 ? "selected" : "",
+        ttls_phase2 == 0 ? "selected" : "", ttls_phase2 == 1 ? "selected" : "",
+        ttls_phase2 == 2 ? "selected" : "", ttls_phase2 == 3 ? "selected" : "",
+        use_cert_bundle ? "checked" : "", disable_time_check ? "checked" : "",
+        sta_mac_str);
+    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 6: Static IP Settings */
+    snprintf(section, sizeof(section), CONFIG_CHUNK_STATIC,
+        static_ip, subnet_mask, gateway_addr);
+    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 7: Remote Console */
+    snprintf(section, sizeof(section), CONFIG_CHUNK_RC,
+        rc_enabled_checked, rc_disabled_checked,
+        rc_status_color, rc_status_text, rc_kick_section,
+        rc_config.port,
+        rc_ap_chk, rc_sta_chk, rc_vpn_chk,
+        (unsigned long)rc_config.idle_timeout_sec);
+    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 8: PCAP */
+    char sta_ip_str[16];
+    {
+        ip4_addr_t sta_addr;
+        sta_addr.addr = my_ip;
+        snprintf(sta_ip_str, sizeof(sta_ip_str), IPSTR, IP2STR(&sta_addr));
+    }
+    snprintf(section, sizeof(section), CONFIG_CHUNK_PCAP,
+        pcap_mode_off_sel, pcap_mode_acl_sel, pcap_mode_promisc_sel,
+        pcap_client_color, pcap_client_text,
+        (unsigned long)pcap_captured, (unsigned long)pcap_dropped,
+        current_snaplen, sta_ip_str);
+    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 9: Device management heading */
+    httpd_resp_send_chunk(req, CONFIG_CHUNK_TAIL, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 9a: Dynamic OTA info (running partition, version) */
+    {
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        const esp_app_desc_t *app_desc = esp_app_get_description();
+        snprintf(section, sizeof(section),
+            "<table>"
+            "<tr><td>Running</td><td>%s</td></tr>"
+            "<tr><td>Version</td><td>%s</td></tr>"
+            "<tr><td>Built</td><td>%s %s</td></tr>"
+            "</table>",
+            running ? running->label : "unknown",
+            app_desc ? app_desc->version : "unknown",
+            app_desc ? app_desc->date : "", app_desc ? app_desc->time : "");
+        httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Chunk 9b: OTA upload form, config backup/restore, and footer */
+    httpd_resp_send_chunk(req, CONFIG_CHUNK_TAIL2, HTTPD_RESP_USE_STRLEN);
+
+    /* End chunked response */
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    /* Cleanup */
+    free(safe_ssid);
+    free(safe_ent_username);
+    free(safe_ent_identity);
+    free(ap_ip_str);
+
+    return ESP_OK;
+}
+
+static httpd_uri_t configp = {
+    .uri       = "/config",
+    .method    = HTTP_GET,
+    .handler   = config_get_handler,
+};
+
+/* Mappings page GET handler (DHCP Reservations + Port Forwarding) - Chunked transfer */
+static esp_err_t mappings_get_handler(httpd_req_t *req)
+{
+    resume_sta_if_scan_idle();
+    /* Check authentication if password protection is enabled */
+    bool password_protection_enabled = is_web_password_set();
+
+    if (password_protection_enabled && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /mappings from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        /* Redirect to index page with auth_required flag */
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/?auth_required=1");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    char* buf;
+    size_t buf_len;
+    char error_msg[128] = "";
+
+    /* Read URL query string length and allocate memory for length + 1 */
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = malloc(buf_len);
+        if (buf == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate memory for query string");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            return ESP_ERR_NO_MEM;
+        }
+
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            ESP_LOGI(TAG, "Found URL query => %s", buf);
+
+            char param1[64];
+            char param2[64];
+            char param3[64];
+            char param4[64];
+
+            /* Check for error parameter first */
+            if (httpd_query_key_value(buf, "error", param1, sizeof(param1)) == ESP_OK) {
+                /* Decode + back to spaces */
+                for (char *p = param1; *p; p++) {
+                    if (*p == '+') *p = ' ';
+                }
+                snprintf(error_msg, sizeof(error_msg), "%s", param1);
+            }
+
+            /* Check for add DHCP reservation */
+            if (httpd_query_key_value(buf, "dhcp_action", param1, sizeof(param1)) == ESP_OK) {
+                if (strcmp(param1, "Add+Reservation") == 0 || strcmp(param1, "Add Reservation") == 0) {
+                    if (httpd_query_key_value(buf, "dhcp_mac", param1, sizeof(param1)) == ESP_OK &&
+                        httpd_query_key_value(buf, "dhcp_ip", param2, sizeof(param2)) == ESP_OK) {
+
+                        preprocess_string(param1);
+                        preprocess_string(param2);
+
+                        const char *err_msg = NULL;
+
+                        // Parse MAC address
+                        unsigned int mac[6];
+                        uint8_t mac_bytes[6];
+                        if (sscanf(param1, "%02x:%02x:%02x:%02x:%02x:%02x",
+                                   &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6 &&
+                            sscanf(param1, "%02x-%02x-%02x-%02x-%02x-%02x",
+                                   &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6) {
+                            err_msg = "Invalid MAC address format";
+                        } else {
+                            for (int i = 0; i < 6; i++) {
+                                mac_bytes[i] = (uint8_t)mac[i];
+                            }
+
+                            uint32_t ip = esp_ip4addr_aton(param2);
+                            if (ip == IPADDR_NONE) {
+                                err_msg = "Invalid IP address";
+                            } else if ((ip & 0x00FFFFFF) != (my_ap_ip & 0x00FFFFFF)) {
+                                err_msg = "IP must be in the same network as the downlink";
+                            } else {
+                                const char *name = NULL;
+                                if (httpd_query_key_value(buf, "dhcp_name", param3, sizeof(param3)) == ESP_OK && strlen(param3) > 0) {
+                                    preprocess_string(param3);
+                                    name = param3;
+                                }
+                                add_dhcp_reservation(mac_bytes, ip, name);
+                                ESP_LOGI(TAG, "Added DHCP reservation: %s -> %s", param1, param2);
+                            }
+                        }
+
+                        if (err_msg != NULL) {
+                            /* Redirect back with error parameter */
+                            char redirect_url[128];
+                            snprintf(redirect_url, sizeof(redirect_url), "/mappings?error=%s", err_msg);
+                            for (char *p = redirect_url; *p; p++) {
+                                if (*p == ' ') *p = '+';
+                            }
+                            httpd_resp_set_status(req, "303 See Other");
+                            httpd_resp_set_hdr(req, "Location", redirect_url);
+                            httpd_resp_send(req, NULL, 0);
+                            free(buf);
+                            return ESP_OK;
+                        }
+                    }
+                }
+            }
+
+            /* Check for delete DHCP reservation */
+            if (httpd_query_key_value(buf, "del_dhcp_mac", param1, sizeof(param1)) == ESP_OK) {
+                preprocess_string(param1);
+                unsigned int mac[6];
+                if (sscanf(param1, "%02X:%02X:%02X:%02X:%02X:%02X",
+                           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6 ||
+                    sscanf(param1, "%02x:%02x:%02x:%02x:%02x:%02x",
+                           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+                    uint8_t mac_bytes[6];
+                    for (int i = 0; i < 6; i++) {
+                        mac_bytes[i] = (uint8_t)mac[i];
+                    }
+                    del_dhcp_reservation(mac_bytes);
+                    ESP_LOGI(TAG, "Deleted DHCP reservation: %s", param1);
+                }
+            }
+
+            /* Check for add port mapping */
+            if (httpd_query_key_value(buf, "port_action", param1, sizeof(param1)) == ESP_OK) {
+                if (strcmp(param1, "Add+Forward") == 0 || strcmp(param1, "Add Forward") == 0) {
+                    if (httpd_query_key_value(buf, "proto", param1, sizeof(param1)) == ESP_OK &&
+                        httpd_query_key_value(buf, "ext_port", param2, sizeof(param2)) == ESP_OK &&
+                        httpd_query_key_value(buf, "int_ip", param3, sizeof(param3)) == ESP_OK &&
+                        httpd_query_key_value(buf, "int_port", param4, sizeof(param4)) == ESP_OK) {
+
+                        preprocess_string(param3);
+                        uint8_t proto = (strcmp(param1, "TCP") == 0) ? PROTO_TCP : PROTO_UDP;
+                        uint16_t ext_port = atoi(param2);
+                        uint32_t int_ip = esp_ip4addr_aton(param3);
+
+                        /* If IP parsing failed, try resolving as device name */
+                        if (int_ip == IPADDR_NONE) {
+                            if (!resolve_device_name_to_ip(param3, &int_ip)) {
+                                ESP_LOGW(TAG, "Invalid IP or device name: %s", param3);
+                            }
+                        }
+                        uint16_t int_port = atoi(param4);
+
+                        /* Validate internal IP is in same /24 network as downlink interface */
+                        const char *err_msg = NULL;
+                        if (int_ip == IPADDR_NONE) {
+                            err_msg = "Invalid IP address or device name";
+                        } else if ((int_ip & 0x00FFFFFF) != (my_ap_ip & 0x00FFFFFF)) {
+                            esp_ip4_addr_t ap_addr;
+                            ap_addr.addr = my_ap_ip;
+                            ESP_LOGW(TAG, "Internal IP not in downlink network (" IPSTR "/24)", IP2STR(&ap_addr));
+                            err_msg = "Internal IP must be in the same network as the downlink";
+                        } else {
+                            /* Check if external port is already in use for this protocol */
+                            for (int i = 0; i < IP_PORTMAP_MAX; i++) {
+                                if (portmap_tab[i].valid &&
+                                    portmap_tab[i].proto == proto &&
+                                    portmap_tab[i].mport == ext_port) {
+                                    ESP_LOGW(TAG, "External port %d already mapped", ext_port);
+                                    err_msg = "External port is already in use";
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (err_msg == NULL) {
+                            uint8_t iface = 0;  // Default: STA
+                            char iface_param[8];
+                            if (httpd_query_key_value(buf, "iface", iface_param, sizeof(iface_param)) == ESP_OK) {
+                                if (strcmp(iface_param, "VPN") == 0) iface = 1;
+                            }
+                            add_portmap(proto, ext_port, int_ip, int_port, iface);
+                            ESP_LOGI(TAG, "Added port mapping: %s %s %d -> %s:%d",
+                                     iface ? "VPN" : "STA", param1, ext_port, param3, int_port);
+                        } else {
+                            /* Redirect back with error parameter */
+                            char redirect_url[128];
+                            snprintf(redirect_url, sizeof(redirect_url), "/mappings?error=%s", err_msg);
+                            /* URL encode spaces */
+                            for (char *p = redirect_url; *p; p++) {
+                                if (*p == ' ') *p = '+';
+                            }
+                            httpd_resp_set_status(req, "303 See Other");
+                            httpd_resp_set_hdr(req, "Location", redirect_url);
+                            httpd_resp_send(req, NULL, 0);
+                            free(buf);
+                            return ESP_OK;
+                        }
+                    }
+                }
+            }
+
+            /* Check for delete port mapping */
+            if (httpd_query_key_value(buf, "del_proto", param1, sizeof(param1)) == ESP_OK &&
+                httpd_query_key_value(buf, "del_port", param2, sizeof(param2)) == ESP_OK) {
+                uint8_t proto = (strcmp(param1, "TCP") == 0) ? PROTO_TCP : PROTO_UDP;
+                uint16_t port = atoi(param2);
+                del_portmap(proto, port);
+                ESP_LOGI(TAG, "Deleted port mapping: %s %d", param1, port);
+            }
+        }
+        free(buf);
+    }
+
+    /* Reusable buffer for building individual rows */
+    char row[384];
+
+    /* --- Begin chunked response --- */
+
+    /* Chunk 1: Page header (styles, scripts) */
+    httpd_resp_send_chunk(req, MAPPINGS_CHUNK_HEAD, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 2: Error modal (if any) */
+    if (error_msg[0] != '\0') {
+        snprintf(row, sizeof(row),
+            "<div class='modal-overlay show' id='errorModal'>"
+            "<div class='modal-box'>"
+            "<h3>Error</h3>"
+            "<p>%s</p>"
+            "<button onclick=\"document.getElementById('errorModal').classList.remove('show'); history.replaceState(null, '', '/mappings');\">OK</button>"
+            "</div>"
+            "</div>",
+            error_msg);
+        httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Chunk 3: Container start and header */
+    httpd_resp_send_chunk(req, MAPPINGS_CHUNK_MID1, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 4: Logout button (if authenticated) */
+    if (session_active && password_protection_enabled) {
+        httpd_resp_send_chunk(req,
+            "<a href='/?logout=1' style='padding: 0.4rem 1rem; background: rgba(255,82,82,0.15); color: #ff5252; border: 1px solid #ff5252; border-radius: 6px; text-decoration: none; font-size: 0.85rem; font-weight: 500;'>Logout</a>",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (eth_dhcps_enabled) {
+        /* Connected clients section (relies on DHCP leases) */
+        httpd_resp_send_chunk(req, MAPPINGS_CHUNK_MID2, HTTPD_RESP_USE_STRLEN);
+
+        #define MAX_DISPLAYED_CLIENTS 8
+        connected_client_t clients[MAX_DISPLAYED_CLIENTS];
+        int client_count = get_connected_clients(clients, MAX_DISPLAYED_CLIENTS);
+        connect_count = client_count;
+
+        if (client_count > 0) {
+            for (int i = 0; i < client_count; i++) {
+                char ip_str[16] = "-";
+                if (clients[i].has_ip) {
+                    esp_ip4_addr_t addr;
+                    addr.addr = clients[i].ip;
+                    snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&addr));
+                }
+
+                char mac_str[18];
+                snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    clients[i].mac[0], clients[i].mac[1],
+                    clients[i].mac[2], clients[i].mac[3],
+                    clients[i].mac[4], clients[i].mac[5]);
+
+                /* Escape single quotes in name for JavaScript */
+                char js_name[DHCP_RESERVATION_NAME_LEN * 2];
+                const char *src_name = clients[i].name[0] ? clients[i].name : "";
+                int j = 0;
+                for (int k = 0; src_name[k] && j < (int)sizeof(js_name) - 2; k++) {
+                    if (src_name[k] == '\'') {
+                        js_name[j++] = '\\';
+                    }
+                    js_name[j++] = src_name[k];
+                }
+                js_name[j] = '\0';
+
+                snprintf(row, sizeof(row),
+                    "<tr>"
+                    "<td>%s</td>"
+                    "<td>%s</td>"
+                    "<td>%s</td>"
+                    "<td><button type='button' class='select-button' onclick=\"fillDhcpForm('%s','%s','%s')\">Select</button></td>"
+                    "</tr>",
+                    mac_str,
+                    ip_str,
+                    clients[i].name[0] ? clients[i].name : "-",
+                    mac_str,
+                    clients[i].has_ip ? ip_str : "",
+                    js_name
+                );
+                httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+            }
+        } else {
+            httpd_resp_send_chunk(req,
+                "<tr><td colspan='4' style='text-align:center; color:#888;'>No clients connected</td></tr>",
+                HTTPD_RESP_USE_STRLEN);
+        }
+    } else {
+        /* Close the header div when clients/DHCP sections are skipped */
+        httpd_resp_send_chunk(req, "</div>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* DHCP Reservations section (only if DHCP server enabled) */
+    if (eth_dhcps_enabled) {
+        /* DHCP reservations heading */
+        httpd_resp_send_chunk(req, MAPPINGS_CHUNK_MID3, HTTPD_RESP_USE_STRLEN);
+
+        /* DHCP Pool info */
+        {
+            uint32_t start_ip, end_ip;
+            get_dhcp_pool_range(my_ap_ip, &start_ip, &end_ip);
+            esp_ip4_addr_t start_addr, end_addr;
+            start_addr.addr = start_ip;
+            end_addr.addr = end_ip;
+            snprintf(row, sizeof(row),
+                     "<small style='color:#888;'>Pool: " IPSTR " - " IPSTR "</small>",
+                     IP2STR(&start_addr), IP2STR(&end_addr));
+            httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+        }
+
+        /* DHCP reservations table header */
+        httpd_resp_send_chunk(req, MAPPINGS_CHUNK_MID3B, HTTPD_RESP_USE_STRLEN);
+
+        /* Stream DHCP reservation rows */
+        bool has_reservations = false;
+        for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
+            if (dhcp_reservations[i].valid) {
+                has_reservations = true;
+                char ip_col[64];
+                esp_ip4_addr_t addr;
+                addr.addr = dhcp_reservations[i].ip;
+                snprintf(ip_col, sizeof(ip_col), IPSTR, IP2STR(&addr));
+
+                snprintf(row, sizeof(row),
+                    "<tr>"
+                    "<td>%02X:%02X:%02X:%02X:%02X:%02X</td>"
+                    "<td>%s</td>"
+                    "<td>%s</td>"
+                    "<td><a href='/mappings?del_dhcp_mac=%02X:%02X:%02X:%02X:%02X:%02X' class='red-button'>Delete</a></td>"
+                    "</tr>",
+                    dhcp_reservations[i].mac[0], dhcp_reservations[i].mac[1],
+                    dhcp_reservations[i].mac[2], dhcp_reservations[i].mac[3],
+                    dhcp_reservations[i].mac[4], dhcp_reservations[i].mac[5],
+                    ip_col,
+                    dhcp_reservations[i].name[0] ? dhcp_reservations[i].name : "-",
+                    dhcp_reservations[i].mac[0], dhcp_reservations[i].mac[1],
+                    dhcp_reservations[i].mac[2], dhcp_reservations[i].mac[3],
+                    dhcp_reservations[i].mac[4], dhcp_reservations[i].mac[5]
+                );
+                httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+            }
+        }
+
+        if (!has_reservations) {
+            httpd_resp_send_chunk(req,
+                "<tr><td colspan='4' style='text-align:center; color:#888;'>No DHCP reservations configured</td></tr>",
+                HTTPD_RESP_USE_STRLEN);
+        }
+
+        /* DHCP add reservation form */
+        httpd_resp_send_chunk(req, MAPPINGS_CHUNK_DHCP_FORM, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Port Forwarding section (only if NAT enabled) */
+    if (eth_nat_enabled) {
+        httpd_resp_send_chunk(req, MAPPINGS_CHUNK_PORTFWD_HEAD, HTTPD_RESP_USE_STRLEN);
+
+        /* Stream port mapping rows */
+        bool has_mappings = false;
+        for (int i = 0; i < IP_PORTMAP_MAX; i++) {
+            if (portmap_tab[i].valid) {
+                has_mappings = true;
+
+                /* Try to look up device name for destination IP */
+                const char *name = lookup_device_name_by_ip(portmap_tab[i].daddr);
+                char ip_or_name[DHCP_RESERVATION_NAME_LEN];
+                if (name) {
+                    snprintf(ip_or_name, sizeof(ip_or_name), "%s", name);
+                } else {
+                    esp_ip4_addr_t addr;
+                    addr.addr = portmap_tab[i].daddr;
+                    snprintf(ip_or_name, sizeof(ip_or_name), IPSTR, IP2STR(&addr));
+                }
+
+                snprintf(row, sizeof(row),
+                    "<tr>"
+                    "<td>%s</td>"
+                    "<td>%s</td>"
+                    "<td>%d</td>"
+                    "<td>%s</td>"
+                    "<td>%d</td>"
+                    "<td><a href='/mappings?del_proto=%s&del_port=%d' class='red-button'>Delete</a></td>"
+                    "</tr>",
+                    portmap_tab[i].iface == 1 ? "VPN" : "STA",
+                    portmap_tab[i].proto == PROTO_TCP ? "TCP" : "UDP",
+                    portmap_tab[i].mport,
+                    ip_or_name,
+                    portmap_tab[i].dport,
+                    portmap_tab[i].proto == PROTO_TCP ? "TCP" : "UDP",
+                    portmap_tab[i].mport
+                );
+                httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+            }
+        }
+
+        if (!has_mappings) {
+            httpd_resp_send_chunk(req,
+                "<tr><td colspan='6' style='text-align:center; color:#888;'>No port mappings configured</td></tr>",
+                HTTPD_RESP_USE_STRLEN);
+        }
+
+        /* Port forwarding add form */
+        httpd_resp_send_chunk(req, MAPPINGS_CHUNK_PORTFWD_FORM, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Page footer */
+    httpd_resp_send_chunk(req, MAPPINGS_CHUNK_TAIL, HTTPD_RESP_USE_STRLEN);
+
+    /* End chunked response */
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    return ESP_OK;
+}
+
+static httpd_uri_t mappingsp = {
+    .uri       = "/mappings",
+    .method    = HTTP_GET,
+    .handler   = mappings_get_handler,
+};
+
+/* Firewall (ACL) page GET handler */
+static esp_err_t firewall_get_handler(httpd_req_t *req)
+{
+    resume_sta_if_scan_idle();
+    /* Check authentication if password protection is enabled */
+    bool password_protection_enabled = is_web_password_set();
+
+    if (password_protection_enabled && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /firewall from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        /* Redirect to index page with auth_required flag */
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/?auth_required=1");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    char* buf;
+    size_t buf_len;
+    bool action_performed = false;
+    char error_msg[128] = "";
+
+    /* Read URL query string length and allocate memory for length + 1 */
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = malloc(buf_len);
+        if (buf == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate memory for query string");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            return ESP_ERR_NO_MEM;
+        }
+
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            ESP_LOGI(TAG, "Firewall query => %s", buf);
+
+            char param[64];
+
+            /* Check for error parameter first */
+            char error_param[128];
+            if (httpd_query_key_value(buf, "error", error_param, sizeof(error_param)) == ESP_OK) {
+                /* Decode + back to spaces */
+                for (char *p = error_param; *p; p++) {
+                    if (*p == '+') *p = ' ';
+                }
+                snprintf(error_msg, sizeof(error_msg), "%s", error_param);
+            }
+
+            /* Handle Add Rule */
+            if (httpd_query_key_value(buf, "acl_action", param, sizeof(param)) == ESP_OK) {
+                if (strcmp(param, "Add+Rule") == 0 || strcmp(param, "Add Rule") == 0) {
+                    char list_str[8], proto_str[8], src_ip_str[32], src_port_str[8];
+                    char dst_ip_str[32], dst_port_str[8], action_str[8];
+
+                    if (httpd_query_key_value(buf, "acl_list", list_str, sizeof(list_str)) == ESP_OK &&
+                        httpd_query_key_value(buf, "proto", proto_str, sizeof(proto_str)) == ESP_OK &&
+                        httpd_query_key_value(buf, "src_ip", src_ip_str, sizeof(src_ip_str)) == ESP_OK &&
+                        httpd_query_key_value(buf, "dst_ip", dst_ip_str, sizeof(dst_ip_str)) == ESP_OK &&
+                        httpd_query_key_value(buf, "action", action_str, sizeof(action_str)) == ESP_OK) {
+
+                        preprocess_string(src_ip_str);
+                        preprocess_string(dst_ip_str);
+
+                        uint8_t list_no = atoi(list_str);
+                        uint8_t proto = atoi(proto_str);
+                        uint8_t action = atoi(action_str);
+
+                        const char *validation_error = NULL;
+
+                        /* Parse source IP (try IP/CIDR first, then device name) */
+                        uint32_t src_ip, src_mask;
+                        if (strlen(src_ip_str) == 0) {
+                            src_ip = 0;
+                            src_mask = 0;  /* any */
+                        } else if (!acl_parse_ip(src_ip_str, &src_ip, &src_mask)) {
+                            /* Try resolving as device name */
+                            if (resolve_device_name_to_ip(src_ip_str, &src_ip)) {
+                                src_mask = 0xFFFFFFFF;  /* /32 for device names */
+                            } else {
+                                validation_error = "Invalid source IP address or device name";
+                            }
+                        }
+
+                        /* Parse destination IP (try IP/CIDR first, then device name) */
+                        uint32_t dst_ip, dst_mask;
+                        if (validation_error == NULL) {
+                            if (strlen(dst_ip_str) == 0) {
+                                dst_ip = 0;
+                                dst_mask = 0;  /* any */
+                            } else if (!acl_parse_ip(dst_ip_str, &dst_ip, &dst_mask)) {
+                                /* Try resolving as device name */
+                                if (resolve_device_name_to_ip(dst_ip_str, &dst_ip)) {
+                                    dst_mask = 0xFFFFFFFF;  /* /32 for device names */
+                                } else {
+                                    validation_error = "Invalid destination IP address or device name";
+                                }
+                            }
+                        }
+
+                        /* Parse ports */
+                        uint16_t s_port = 0, d_port = 0;
+                        if (httpd_query_key_value(buf, "src_port", src_port_str, sizeof(src_port_str)) == ESP_OK) {
+                            preprocess_string(src_port_str);
+                            if (strcmp(src_port_str, "*") != 0 && strlen(src_port_str) > 0) {
+                                s_port = atoi(src_port_str);
+                            }
+                        }
+                        if (httpd_query_key_value(buf, "dst_port", dst_port_str, sizeof(dst_port_str)) == ESP_OK) {
+                            preprocess_string(dst_port_str);
+                            if (strcmp(dst_port_str, "*") != 0 && strlen(dst_port_str) > 0) {
+                                d_port = atoi(dst_port_str);
+                            }
+                        }
+
+                        if (validation_error != NULL) {
+                            /* Redirect back with error parameter */
+                            char redirect_url[192];
+                            snprintf(redirect_url, sizeof(redirect_url), "/firewall?error=%s", validation_error);
+                            /* URL encode spaces */
+                            for (char *p = redirect_url; *p; p++) {
+                                if (*p == ' ') *p = '+';
+                            }
+                            httpd_resp_set_status(req, "303 See Other");
+                            httpd_resp_set_hdr(req, "Location", redirect_url);
+                            httpd_resp_send(req, NULL, 0);
+                            free(buf);
+                            return ESP_OK;
+                        }
+
+                        if (list_no < MAX_ACL_LISTS) {
+                            if (acl_add(list_no, src_ip, src_mask, dst_ip, dst_mask, proto, s_port, d_port, action)) {
+                                save_acl_rules();
+                                ESP_LOGI(TAG, "Added ACL rule to list %d", list_no);
+                                action_performed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Handle Delete Rule */
+            if (httpd_query_key_value(buf, "del_acl", param, sizeof(param)) == ESP_OK) {
+                uint8_t list_no = atoi(param);
+                char idx_str[8];
+                if (httpd_query_key_value(buf, "del_idx", idx_str, sizeof(idx_str)) == ESP_OK) {
+                    uint8_t rule_idx = atoi(idx_str);
+                    if (list_no < MAX_ACL_LISTS && acl_delete(list_no, rule_idx)) {
+                        save_acl_rules();
+                        ESP_LOGI(TAG, "Deleted ACL rule %d from list %d", rule_idx, list_no);
+                        action_performed = true;
+                    }
+                }
+            }
+
+            /* Handle Clear List */
+            if (httpd_query_key_value(buf, "clear_acl", param, sizeof(param)) == ESP_OK) {
+                uint8_t list_no = atoi(param);
+                if (list_no < MAX_ACL_LISTS) {
+                    acl_clear(list_no);
+                    save_acl_rules();
+                    ESP_LOGI(TAG, "Cleared ACL list %d", list_no);
+                    action_performed = true;
+                }
+            }
+        }
+        free(buf);
+    }
+
+    /* Redirect after action to prevent duplicate submissions on refresh */
+    if (action_performed) {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/firewall");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    /* Reusable buffer for building individual elements */
+    char row[384];
+
+    /* --- Begin chunked response --- */
+
+    /* Chunk 1: Page header (styles) */
+    httpd_resp_send_chunk(req, FIREWALL_CHUNK_HEAD, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 2: Error modal (if any) */
+    if (error_msg[0] != '\0') {
+        snprintf(row, sizeof(row),
+            "<div class='modal-overlay show' id='errorModal'>"
+            "<div class='modal-box'>"
+            "<h3>Error</h3>"
+            "<p>%s</p>"
+            "<button onclick=\"document.getElementById('errorModal').classList.remove('show'); history.replaceState(null, '', '/firewall');\">OK</button>"
+            "</div>"
+            "</div>",
+            error_msg);
+        httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Chunk 3: Container start and header */
+    httpd_resp_send_chunk(req, FIREWALL_CHUNK_MID1, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 4: Logout button (if authenticated) */
+    if (session_active && password_protection_enabled) {
+        httpd_resp_send_chunk(req,
+            "<a href='/?logout=1' style='padding: 0.4rem 1rem; background: rgba(255,82,82,0.15); color: #ff5252; border: 1px solid #ff5252; border-radius: 6px; text-decoration: none; font-size: 0.85rem; font-weight: 500;'>Logout</a>",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Chunk 5: Description text */
+    httpd_resp_send_chunk(req, FIREWALL_CHUNK_MID2, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 6: Stream ACL sections.
+     * Copy data under lock then release before sending HTTP chunks,
+     * because httpd_resp_send_chunk can block on TCP and would deadlock
+     * with acl_check_packet holding the same lock in the netif hooks. */
+    for (int list_no = 0; list_no < MAX_ACL_LISTS; list_no++) {
+        /* Snapshot ACL data under the lock */
+        acl_entry_t rules_copy[MAX_ACL_ENTRIES];
+        acl_stats_t stats_copy;
+        const char* list_desc;
+
+        acl_lock();
+        acl_entry_t* rules = acl_get_rules(list_no);
+        acl_stats_t* stats = acl_get_stats(list_no);
+        list_desc = acl_get_desc(list_no);
+        memcpy(rules_copy, rules, sizeof(rules_copy));
+        memcpy(&stats_copy, stats, sizeof(stats_copy));
+        acl_unlock();
+
+        /* Section header with stats (no lock held) */
+        snprintf(row, sizeof(row),
+            "<div class='acl-section'>"
+            "<h3>%s</h3>"
+            "<div class='stats'>"
+            "<span class='allowed'>Allowed: %lu</span>"
+            "<span class='denied'>Denied: %lu</span>"
+            "<span>No match: %lu</span>"
+            "<a href='/firewall?clear_acl=%d' class='orange-button' style='float:right;'>Clear</a>"
+            "</div>",
+            list_desc,
+            (unsigned long)stats_copy.packets_allowed,
+            (unsigned long)stats_copy.packets_denied,
+            (unsigned long)stats_copy.packets_nomatch,
+            list_no);
+        httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+        /* Rules table header */
+        httpd_resp_send_chunk(req,
+            "<table class='data-table'>"
+            "<thead><tr>"
+            "<th>#</th><th>Proto</th><th>Source</th><th>SPort</th>"
+            "<th>Dest</th><th>DPort</th><th>Action</th><th>Hits</th><th></th>"
+            "</tr></thead><tbody>",
+            HTTPD_RESP_USE_STRLEN);
+
+        /* Stream rule rows from snapshot */
+        int rule_count = 0;
+        for (int i = 0; i < MAX_ACL_ENTRIES; i++) {
+            if (!rules_copy[i].valid) continue;
+            rule_count++;
+
+            /* Format protocol */
+            const char *proto_str;
+            switch (rules_copy[i].proto) {
+                case 0:  proto_str = "IP"; break;
+                case 1:  proto_str = "ICMP"; break;
+                case 6:  proto_str = "TCP"; break;
+                case 17: proto_str = "UDP"; break;
+                default: proto_str = "?"; break;
+            }
+
+            /* Format IP addresses with device names for /32 */
+            char src_str[DHCP_RESERVATION_NAME_LEN], dst_str[DHCP_RESERVATION_NAME_LEN];
+            if (rules_copy[i].s_mask == 0xFFFFFFFF) {
+                const char* name = lookup_device_name_by_ip(rules_copy[i].src);
+                if (name) {
+                    snprintf(src_str, sizeof(src_str), "%s", name);
+                } else {
+                    acl_format_ip(rules_copy[i].src, rules_copy[i].s_mask, src_str, sizeof(src_str));
+                }
+            } else {
+                acl_format_ip(rules_copy[i].src, rules_copy[i].s_mask, src_str, sizeof(src_str));
+            }
+            if (rules_copy[i].d_mask == 0xFFFFFFFF) {
+                const char* name = lookup_device_name_by_ip(rules_copy[i].dest);
+                if (name) {
+                    snprintf(dst_str, sizeof(dst_str), "%s", name);
+                } else {
+                    acl_format_ip(rules_copy[i].dest, rules_copy[i].d_mask, dst_str, sizeof(dst_str));
+                }
+            } else {
+                acl_format_ip(rules_copy[i].dest, rules_copy[i].d_mask, dst_str, sizeof(dst_str));
+            }
+
+            /* Format ports */
+            char s_port_str[8], d_port_str[8];
+            if (rules_copy[i].s_port == 0) strcpy(s_port_str, "*");
+            else snprintf(s_port_str, sizeof(s_port_str), "%d", rules_copy[i].s_port);
+            if (rules_copy[i].d_port == 0) strcpy(d_port_str, "*");
+            else snprintf(d_port_str, sizeof(d_port_str), "%d", rules_copy[i].d_port);
+
+            /* Format action */
+            const char *action_str;
+            uint8_t action = rules_copy[i].allow & 0x01;
+            uint8_t monitor = rules_copy[i].allow & ACL_MONITOR;
+            if (action == ACL_ALLOW) {
+                action_str = monitor ? "Allow+M" : "Allow";
+            } else {
+                action_str = monitor ? "Deny+M" : "Deny";
+            }
+
+            snprintf(row, sizeof(row),
+                "<tr>"
+                "<td>%d</td><td>%s</td><td>%s</td><td>%s</td>"
+                "<td>%s</td><td>%s</td><td>%s</td><td>%lu</td>"
+                "<td><a href='/firewall?del_acl=%d&del_idx=%d' class='red-button'>Del</a></td>"
+                "</tr>",
+                i, proto_str, src_str, s_port_str,
+                dst_str, d_port_str, action_str, (unsigned long)rules_copy[i].hit_count,
+                list_no, i);
+            httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+        }
+
+        if (rule_count == 0) {
+            httpd_resp_send_chunk(req,
+                "<tr><td colspan='9' style='text-align:center; color:#888;'>No rules (all packets allowed)</td></tr>",
+                HTTPD_RESP_USE_STRLEN);
+        }
+
+        /* Close table and section */
+        httpd_resp_send_chunk(req, "</tbody></table></div>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Chunk 7: Add form and footer */
+    httpd_resp_send_chunk(req, FIREWALL_CHUNK_TAIL, HTTPD_RESP_USE_STRLEN);
+
+    /* End chunked response */
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    return ESP_OK;
+}
+
+static httpd_uri_t firewallp = {
+    .uri       = "/firewall",
+    .method    = HTTP_GET,
+    .handler   = firewall_get_handler,
+};
+
+/* Helper function to convert auth mode to string for web UI */
+static const char* web_auth_mode_to_str(wifi_auth_mode_t authmode)
+{
+    switch (authmode) {
+        case WIFI_AUTH_OPEN:            return "Open";
+        case WIFI_AUTH_WEP:             return "WEP";
+        case WIFI_AUTH_WPA_PSK:         return "WPA";
+        case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
+        case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-Ent";
+        default:                        return "Unknown";
+    }
+}
+
+/* URL encode a string for use in query parameters */
+static void url_encode(const char *src, char *dst, size_t dst_len)
+{
+    const char *hex = "0123456789ABCDEF";
+    size_t i = 0;
+
+    while (*src && i < dst_len - 1) {
+        if ((*src >= 'A' && *src <= 'Z') ||
+            (*src >= 'a' && *src <= 'z') ||
+            (*src >= '0' && *src <= '9') ||
+            *src == '-' || *src == '_' || *src == '.' || *src == '~') {
+            dst[i++] = *src;
+        } else if (i + 3 < dst_len) {
+            dst[i++] = '%';
+            dst[i++] = hex[(*src >> 4) & 0x0F];
+            dst[i++] = hex[*src & 0x0F];
+        } else {
+            break;
+        }
+        src++;
+    }
+    dst[i] = '\0';
+}
+
+/* WiFi Scan page GET handler - NOT password protected */
+static esp_err_t scan_get_handler(httpd_req_t *req)
+{
+    /* Check if user can connect (authenticated or no password set) */
+    bool password_protection_enabled = is_web_password_set();
+    bool can_connect = !password_protection_enabled || is_authenticated(req);
+
+    uint16_t ap_count = 0;
+    wifi_ap_record_t *ap_list = NULL;
+    bool scan_in_progress = false;
+    int refresh_time = 15;  /* Default refresh interval */
+
+    /* Suppress STA reconnect attempts while on the scan page */
+    if (!ap_connect) {
+        wifi_scan_active = true;
+    }
+
+    /* Try to get existing scan results first */
+    esp_err_t err = esp_wifi_scan_get_ap_num(&ap_count);
+
+    if (err == ESP_OK && ap_count > 0) {
+        /* We have results from a previous scan — read them */
+        if (ap_count > 20) ap_count = 20;
+        ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
+        if (ap_list != NULL) {
+            esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+        } else {
+            ap_count = 0;
+        }
+    }
+
+    /* Start a (new) background scan for the next refresh */
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+    if (!ap_connect) wifi_scan_active = true;
+    err = esp_wifi_scan_start(&scan_config, false);  /* Non-blocking */
+
+    if (ap_count == 0) {
+        if (err == ESP_OK || err == ESP_ERR_WIFI_STATE) {
+            /* No previous results, scan just started */
+            scan_in_progress = true;
+            refresh_time = 2;  /* Quick refresh to get results */
+        }
+    }
+
+    /* Build the table header with optional Connect column */
+    char header_extra[64] = "";
+    if (can_connect) {
+        strcpy(header_extra, "<th>Action</th>");
+    }
+
+    /* Build scan results HTML */
+    char scan_html[4096] = "";
+    int html_offset = 0;
+
+    if (ap_count == 0) {
+        if (scan_in_progress) {
+            snprintf(scan_html, sizeof(scan_html),
+                "<tr><td colspan='%d' style='text-align:center; color:#00e676;'>"
+                "<span style='display:inline-block; animation: pulse 1s infinite;'>📡 Scanning...</span>"
+                "</td></tr>",
+                can_connect ? 5 : 4);
+        } else {
+            snprintf(scan_html, sizeof(scan_html),
+                "<tr><td colspan='%d' style='text-align:center; color:#888;'>No networks found</td></tr>",
+                can_connect ? 5 : 4);
+        }
+    } else {
+        for (int i = 0; i < ap_count && html_offset < (int)(sizeof(scan_html) - 512); i++) {
+            /* Determine signal strength and build visual bars */
+            const char *signal_class;
+            int rssi = ap_list[i].rssi;
+            int bars;  /* Number of active bars (1-4) */
+
+            if (rssi >= -50) {
+                signal_class = "signal-excellent";
+                bars = 4;
+            } else if (rssi >= -60) {
+                signal_class = "signal-good";
+                bars = 3;
+            } else if (rssi >= -70) {
+                signal_class = "signal-fair";
+                bars = 2;
+            } else if (rssi >= -80) {
+                signal_class = "signal-weak";
+                bars = 1;
+            } else {
+                signal_class = "signal-poor";
+                bars = 1;
+            }
+
+            /* HTML-escape SSID for display */
+            char *safe_ssid = html_escape((const char *)ap_list[i].ssid);
+            if (safe_ssid == NULL) {
+                safe_ssid = strdup("(unknown)");
+            }
+
+            /* Build connect button if allowed */
+            char connect_cell[256] = "";
+            if (can_connect) {
+                char encoded_ssid[128];
+                url_encode((const char *)ap_list[i].ssid, encoded_ssid, sizeof(encoded_ssid));
+                snprintf(connect_cell, sizeof(connect_cell),
+                    "<td><a href='/config?ssid=%s' class='connect-button'>Connect</a></td>",
+                    encoded_ssid);
+            }
+
+            /* Build signal bars HTML with CSS divs */
+            char signal_bars_html[384];
+            const int bar_heights[] = {4, 8, 12, 16};  /* px */
+            int sb_offset = 0;
+            sb_offset += snprintf(signal_bars_html, sizeof(signal_bars_html),
+                "<span class='signal-bars'>");
+            for (int b = 0; b < 4; b++) {
+                if (b < bars) {
+                    sb_offset += snprintf(signal_bars_html + sb_offset, sizeof(signal_bars_html) - sb_offset,
+                        "<span class='bar active %s' style='height:%dpx;'></span>",
+                        signal_class, bar_heights[b]);
+                } else {
+                    sb_offset += snprintf(signal_bars_html + sb_offset, sizeof(signal_bars_html) - sb_offset,
+                        "<span class='bar' style='height:%dpx;'></span>", bar_heights[b]);
+                }
+            }
+            sb_offset += snprintf(signal_bars_html + sb_offset, sizeof(signal_bars_html) - sb_offset,
+                "</span>");
+
+            /* Channel / band info */
+            char ch_info[80];
+            snprintf(ch_info, sizeof(ch_info), "%d", ap_list[i].primary);
+
+            html_offset += snprintf(scan_html + html_offset, sizeof(scan_html) - html_offset,
+                "<tr>"
+                "<td>%s</td>"
+                "<td style='white-space:nowrap;'>%s<span style='color:#888;font-size:0.8rem;margin-left:0.5em;'>%d dBm</span></td>"
+                "<td>%s</td>"
+                "<td>%s</td>"
+                "%s"
+                "</tr>",
+                safe_ssid,
+                signal_bars_html, rssi,
+                ch_info,
+                web_auth_mode_to_str(ap_list[i].authmode),
+                connect_cell
+            );
+
+            free(safe_ssid);
+        }
+    }
+
+    if (ap_list != NULL) {
+        free(ap_list);
+    }
+
+    /* Build the page */
+    const char* scan_page_template = SCAN_PAGE;
+    int page_len = strlen(scan_page_template) + strlen(header_extra) + strlen(scan_html) + 128;
+    char* scan_page = malloc(page_len);
+
+    if (scan_page == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for scan page");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(scan_page, page_len, scan_page_template, refresh_time, ap_count, header_extra, scan_html);
+
+    httpd_resp_send(req, scan_page, strlen(scan_page));
+    free(scan_page);
+
+    return ESP_OK;
+}
+
+static httpd_uri_t scanp = {
+    .uri       = "/scan",
+    .method    = HTTP_GET,
+    .handler   = scan_get_handler,
+};
+
+/* VPN page GET handler */
+static esp_err_t vpn_get_handler(httpd_req_t *req)
+{
+    resume_sta_if_scan_idle();
+    /* Check authentication if password protection is enabled */
+    bool password_protection_enabled = is_web_password_set();
+
+    if (password_protection_enabled && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /vpn from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/?auth_required=1");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    char* buf = NULL;
+    size_t buf_len;
+
+    /* Read URL query string */
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = malloc(buf_len);
+        if (buf != NULL && httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            ESP_LOGI(TAG, "VPN query => %s", buf);
+
+            char param[128];
+            bool has_config = false;
+
+            /* Check if this is a form submission */
+            if (httpd_query_key_value(buf, "vpn_enabled", param, sizeof(param)) == ESP_OK) {
+                has_config = true;
+                nvs_handle_t nvs;
+                if (nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+                    nvs_set_i32(nvs, "vpn_enabled", atoi(param));
+
+                    if (httpd_query_key_value(buf, "vpn_privkey", param, sizeof(param)) == ESP_OK) {
+                        preprocess_string(param);
+                        nvs_set_str(nvs, "vpn_privkey", param);
+                    }
+                    if (httpd_query_key_value(buf, "vpn_pubkey", param, sizeof(param)) == ESP_OK) {
+                        preprocess_string(param);
+                        nvs_set_str(nvs, "vpn_pubkey", param);
+                    }
+                    if (httpd_query_key_value(buf, "vpn_psk", param, sizeof(param)) == ESP_OK) {
+                        preprocess_string(param);
+                        nvs_set_str(nvs, "vpn_psk", param);
+                    }
+                    if (httpd_query_key_value(buf, "vpn_endpoint", param, sizeof(param)) == ESP_OK) {
+                        preprocess_string(param);
+                        nvs_set_str(nvs, "vpn_endpoint", param);
+                    }
+                    if (httpd_query_key_value(buf, "vpn_port", param, sizeof(param)) == ESP_OK) {
+                        nvs_set_i32(nvs, "vpn_port", atoi(param));
+                    }
+                    if (httpd_query_key_value(buf, "vpn_ip", param, sizeof(param)) == ESP_OK) {
+                        preprocess_string(param);
+                        nvs_set_str(nvs, "vpn_ip", param);
+                    }
+                    if (httpd_query_key_value(buf, "vpn_mask", param, sizeof(param)) == ESP_OK) {
+                        preprocess_string(param);
+                        nvs_set_str(nvs, "vpn_mask", param);
+                    }
+                    if (httpd_query_key_value(buf, "vpn_ka", param, sizeof(param)) == ESP_OK) {
+                        nvs_set_i32(nvs, "vpn_ka", atoi(param));
+                    }
+                    if (httpd_query_key_value(buf, "vpn_ks", param, sizeof(param)) == ESP_OK) {
+                        nvs_set_i32(nvs, "vpn_ks", atoi(param));
+                    }
+                    if (httpd_query_key_value(buf, "vpn_rall", param, sizeof(param)) == ESP_OK) {
+                        nvs_set_i32(nvs, "vpn_rall", atoi(param));
+                    }
+
+                    nvs_commit(nvs);
+                    nvs_close(nvs);
+                    ESP_LOGI(TAG, "VPN settings saved, scheduling restart");
+                    esp_timer_start_once(restart_timer, 500000);
+                }
+            }
+
+            /* If config was submitted, let the JS handle the "rebooting" message */
+            if (has_config) {
+                /* Fall through to render the page (JS will detect query params and show reboot msg) */
+            }
+        }
+        if (buf) free(buf);
+    }
+
+    /* Reusable buffer for VPN page rows */
+    #define VPN_BUF_SIZE 768
+    char *row = malloc(VPN_BUF_SIZE);
+    if (row == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Head */
+    httpd_resp_send_chunk(req, VPN_CHUNK_HEAD, HTTPD_RESP_USE_STRLEN);
+
+    /* Logout button if authenticated */
+    if (session_active && password_protection_enabled) {
+        httpd_resp_send_chunk(req,
+            "<a href='/?logout=1' style='padding: 0.4rem 1rem; background: rgba(255,82,82,0.15); color: #ff5252; border: 1px solid #ff5252; border-radius: 6px; text-decoration: none; font-size: 0.85rem; font-weight: 500;'>Logout</a>",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Mid (script) */
+    httpd_resp_send_chunk(req, VPN_CHUNK_MID, HTTPD_RESP_USE_STRLEN);
+
+    /* Status section */
+    httpd_resp_send_chunk(req, "<h2>Status</h2><div class='status-table'><table>", HTTPD_RESP_USE_STRLEN);
+
+    if (vpn_enabled) {
+        const char *state, *color;
+        if (vpn_is_connected()) {
+            state = "Connected"; color = "#4caf50";
+        } else if (vpn_connected) {
+            state = "Handshake Pending"; color = "#ffc107";
+        } else {
+            state = "Disconnected"; color = "#f44336";
+        }
+        snprintf(row, VPN_BUF_SIZE, "<tr><td>VPN:</td><td><strong style='color:%s;'>%s</strong></td></tr>", color, state);
+    } else {
+        snprintf(row, VPN_BUF_SIZE, "<tr><td>VPN:</td><td><strong style='color:#888;'>Disabled</strong></td></tr>");
+    }
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    if (vpn_address && vpn_address[0]) {
+        snprintf(row, VPN_BUF_SIZE, "<tr><td>Tunnel IP:</td><td>%s</td></tr>", vpn_address);
+        httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+    }
+    snprintf(row, VPN_BUF_SIZE, "<tr><td>MSS Clamp:</td><td>%u</td></tr><tr><td>Path MTU:</td><td>%u</td></tr>",
+             ap_mss_clamp, ap_pmtu);
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE, "<tr><td>Kill Switch:</td><td><strong style='color:%s;'>%s</strong></td></tr>",
+             vpn_killswitch ? "#4caf50" : "#888", vpn_killswitch ? "On" : "Off");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE, "<tr><td>Route All:</td><td><strong style='color:%s;'>%s</strong></td></tr>",
+             vpn_route_all ? "#4caf50" : "#2196f3", vpn_route_all ? "Yes" : "No (split tunnel)");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    httpd_resp_send_chunk(req, "</table></div>", HTTPD_RESP_USE_STRLEN);
+
+    /* Form - streamed field by field to avoid large snprintf */
+    httpd_resp_send_chunk(req, VPN_CHUNK_FORM_OPEN, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Enabled</td><td><select name='vpn_enabled'>"
+        "<option value='1' %s>On</option><option value='0' %s>Off</option>"
+        "</select></td></tr>",
+        vpn_enabled ? "selected" : "", vpn_enabled ? "" : "selected");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Private Key</td><td><input type='password' name='vpn_privkey' value='%s' placeholder='Base64 private key'/></td></tr>",
+        vpn_private_key ? vpn_private_key : "");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Public Key</td><td><input type='text' name='vpn_pubkey' value='%s' placeholder='Peer base64 public key'/></td></tr>",
+        vpn_public_key ? vpn_public_key : "");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Preshared Key</td><td><input type='password' name='vpn_psk' value='%s' placeholder='Optional'/></td></tr>",
+        vpn_preshared_key ? vpn_preshared_key : "");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Endpoint</td><td><input type='text' name='vpn_endpoint' value='%s' placeholder='Host or IP'/></td></tr>"
+        "<tr><td>Port</td><td><input type='number' name='vpn_port' value='%d' min='1' max='65535'/></td></tr>"
+        "<tr><td>Tunnel IP</td><td><input type='text' name='vpn_ip' value='%s' placeholder='e.g. 10.0.0.2'/></td></tr>"
+        "<tr><td>Netmask</td><td><input type='text' name='vpn_mask' value='%s' placeholder='255.255.255.0'/></td></tr>"
+        "<tr><td>Keepalive (sec)</td><td><input type='number' name='vpn_ka' value='%d' min='0' max='65535'/></td></tr>",
+        vpn_endpoint ? vpn_endpoint : "",
+        (int)vpn_port,
+        vpn_address ? vpn_address : "",
+        vpn_netmask ? vpn_netmask : "255.255.255.0",
+        (int)vpn_keepalive);
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Kill Switch</td><td><select name='vpn_ks'>"
+        "<option value='1' %s>On</option><option value='0' %s>Off</option>"
+        "</select></td></tr>",
+        vpn_killswitch ? "selected" : "", vpn_killswitch ? "" : "selected");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Route All</td><td><select name='vpn_rall'>"
+        "<option value='1' %s>Yes (all traffic)</option><option value='0' %s>No (split tunnel)</option>"
+        "</select></td></tr>",
+        vpn_route_all ? "selected" : "", vpn_route_all ? "" : "selected");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    httpd_resp_send_chunk(req, VPN_CHUNK_FORM_CLOSE, HTTPD_RESP_USE_STRLEN);
+
+    /* End chunked response */
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    free(row);
+    return ESP_OK;
+}
+
+static httpd_uri_t vpnp = {
+    .uri       = "/vpn",
+    .method    = HTTP_GET,
+    .handler   = vpn_get_handler,
+};
+
+static esp_err_t captive_redirect_handler(httpd_req_t *req, httpd_err_code_t err);
+
+httpd_handle_t start_webserver(uint16_t port)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = port;
+    config.stack_size = 16384;  // Large stack needed for mappings page with 3x 2KB HTML buffers
+    config.max_uri_handlers = 13;
+    config.max_uri_len = 1024;
+
+    esp_timer_create(&restart_timer_args, &restart_timer);
+
+    // Start the httpd server
+    ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
+    if (httpd_start(&server, &config) == ESP_OK) {
+        // Set URI handlers
+        ESP_LOGI(TAG, "Registering URI handlers");
+        httpd_register_uri_handler(server, &indexp);
+        httpd_register_uri_handler(server, &configp);
+        httpd_register_uri_handler(server, &mappingsp);
+        httpd_register_uri_handler(server, &firewallp);
+        httpd_register_uri_handler(server, &scanp);
+        httpd_register_uri_handler(server, &vpnp);
+        /* setup page removed — config page handles all settings */
+        httpd_register_uri_handler(server, &favicon_uri);
+        httpd_register_uri_handler(server, &config_exportp);
+        httpd_register_uri_handler(server, &config_importp);
+        httpd_register_uri_handler(server, &ota_uploadp);
+
+        // Start captive portal DNS only when no upstream WiFi is configured
+        if (ssid == NULL || strlen(ssid) == 0) {
+            ESP_LOGI(TAG, "No STA configured, starting captive portal DNS");
+            httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, captive_redirect_handler);
+            web_server_start_captive_dns();
+        }
+
+        return server;
+    }
+
+    ESP_LOGI(TAG, "Error starting server!");
+    return NULL;
+}
+
+static void stop_webserver(httpd_handle_t server)
+{
+    // Stop the httpd server
+    httpd_stop(server);
+}
+
+
+// ---------- Captive portal ----------
+
+// DNS server: resolve every query to 192.168.4.1 so captive-portal checks succeed
+static void dns_server_task(void *pvParameters)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "DNS server: socket failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(53),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "DNS server: bind failed");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Captive portal DNS server started");
+    uint8_t buf[512];
+
+    while (1) {
+        struct sockaddr_in client;
+        socklen_t client_len = sizeof(client);
+        int len = recvfrom(sock, buf, sizeof(buf), 0,
+                           (struct sockaddr *)&client, &client_len);
+        if (len < 12) continue;
+
+        // Turn query into response
+        buf[2] = 0x81;  // QR=1, AA=1, RD=1
+        buf[3] = 0x80;  // RA=1
+        buf[6] = 0x00;  buf[7] = 0x01;  // 1 answer
+
+        // Append A record: name-pointer, type A, class IN, TTL 60, 192.168.4.1
+        int pos = len;
+        buf[pos++] = 0xC0; buf[pos++] = 0x0C;
+        buf[pos++] = 0x00; buf[pos++] = 0x01;
+        buf[pos++] = 0x00; buf[pos++] = 0x01;
+        buf[pos++] = 0x00; buf[pos++] = 0x00;
+        buf[pos++] = 0x00; buf[pos++] = 0x3C;
+        buf[pos++] = 0x00; buf[pos++] = 0x04;
+        buf[pos++] = 192;  buf[pos++] = 168;
+        buf[pos++] = 4;    buf[pos++] = 1;
+
+        sendto(sock, buf, pos, 0,
+               (struct sockaddr *)&client, client_len);
+    }
+}
+
+void web_server_start_captive_dns(void)
+{
+    xTaskCreate(dns_server_task, "dns_srv", 4096, NULL, 5, NULL);
+}
+
+// 404 handler: redirect unknown URIs to the main page (captive portal trigger)
+static esp_err_t captive_redirect_handler(httpd_req_t *req, httpd_err_code_t err)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}

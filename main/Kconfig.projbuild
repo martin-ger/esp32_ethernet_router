@@ -1,0 +1,31 @@
+menu "Example Configuration"
+
+    config STORE_HISTORY
+        bool "Store command history in flash"
+        default y
+        help
+            Linenoise line editing library provides functions to save and load
+            command history. If this option is enabled, initalizes a FAT filesystem
+            and uses it to store command history.
+
+endmenu
+
+menu "Ethernet Downlink"
+
+    config ETH_MDC_GPIO
+        int "ETH MDC GPIO"
+        default 23
+
+    config ETH_MDIO_GPIO
+        int "ETH MDIO GPIO"
+        default 18
+
+    config ETH_PHY_ADDR
+        int "ETH PHY address"
+        default 1
+
+    config ETH_PHY_POWER_GPIO
+        int "ETH PHY power GPIO (-1 for none)"
+        default 16
+
+endmenu
