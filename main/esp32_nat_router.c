@@ -679,8 +679,9 @@ void app_main(void)
         eth_dhcps_enabled = (dhcps_val != 0) ? 1 : 0;
     }
     get_config_param_str("hostname", &hostname);
-    if (hostname == NULL) {
-        hostname = param_set_default("");
+    if (hostname == NULL || hostname[0] == '\0') {
+        free(hostname);
+        hostname = param_set_default("esp32-eth-router");
     }
 
     get_portmap_tab();

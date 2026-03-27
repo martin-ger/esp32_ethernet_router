@@ -793,7 +793,7 @@ static int set_hostname_cmd(int argc, char **argv)
     if (len > 0) {
         printf("Hostname set to: %s\n", name);
     } else {
-        printf("Hostname cleared (will use default 'espressif').\n");
+        printf("Hostname cleared (will use default 'esp32-eth-router').\n");
     }
     printf("Restart to apply.\n");
 
@@ -1228,13 +1228,9 @@ static int show(int argc, char **argv)
             int count = get_connected_clients(clients, 8);
 
             if (count > 0) {
-                // Fetch per-client traffic stats
-                client_stats_entry_t stats[CLIENT_STATS_MAX];
-                int stats_count = client_stats_get_all(stats, CLIENT_STATS_MAX);
-
                 printf("\nClient Details:\n");
-                printf("MAC Address       IP Address       Device Name          TX / RX\n");
-                printf("----------------  ---------------  -------------------  ------------------\n");
+                printf("MAC Address       IP Address       Device Name\n");
+                printf("----------------  ---------------  -------------------\n");
 
                 for (int i = 0; i < count; i++) {
                     char mac_str[18];
@@ -1249,19 +1245,7 @@ static int show(int argc, char **argv)
                         sprintf(ip_str, IPSTR, IP2STR(&addr));
                     }
 
-                    // Find matching traffic stats by MAC
-                    char traffic_str[32] = "-";
-                    for (int j = 0; j < stats_count; j++) {
-                        if (memcmp(stats[j].mac, clients[i].mac, 6) == 0) {
-                            char tx_buf[12], rx_buf[12];
-                            format_bytes_human(stats[j].bytes_sent, tx_buf, sizeof(tx_buf));
-                            format_bytes_human(stats[j].bytes_received, rx_buf, sizeof(rx_buf));
-                            snprintf(traffic_str, sizeof(traffic_str), "%s / %s", tx_buf, rx_buf);
-                            break;
-                        }
-                    }
-
-                    printf("%-17s  %-15s  %-19s  %s\n", mac_str, ip_str, clients[i].name, traffic_str);
+                    printf("%-17s  %-15s  %s\n", mac_str, ip_str, clients[i].name);
                 }
             }
         }
@@ -1319,7 +1303,7 @@ static int show(int argc, char **argv)
         } else {
             printf("  Static IP: <not configured>\n");
         }
-        printf("  Hostname: %s\n", (hostname && hostname[0]) ? hostname : "(default)");
+        printf("  Hostname: %s\n", hostname);
 
         printf("\nEthernet Downlink Settings:\n");
         ip4_addr_t addr;
