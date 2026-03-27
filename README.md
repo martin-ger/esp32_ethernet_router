@@ -1,39 +1,12 @@
 # ESP32 Ethernet Router
 
-Firmware for the WT32-ETH01 board that turns it into a compact network router. 
+Firmware for the **[WT32-ETH01](https://github.com/egnor/wt32-eth01)** board that turns it into a compact network router. 
 
-**Derived from** [esp32_nat_router](https://github.com/martin-ger/esp32_nat_router). The original project uses WiFi as the downlink (AP) and (as one option) Ethernet as the uplink. This variant reverses that: **WiFi STA is the uplink** (Internet) and **Ethernet is the downlink** (LAN).
+**Derived from** [esp32_nat_router](https://github.com/martin-ger/esp32_nat_router). The original project uses WiFi as the downlink (AP) and (as one option) Ethernet as the uplink. This variant reverses that: **WiFi STA is the uplink** (Internet) and **Ethernet is the downlink** (LAN). If you are looking for a plain ESP32 **Ethernet AP** (Layer 2 bridge), check out [esp32_eth_wifi_bridge](https://github.com/martin-ger/esp32_eth_wifi_bridge).
 
 The board connects to an existing WiFi network as a client (STA) and shares that connection with wired devices through its Ethernet port. The Ethernet side runs its own IP subnet, an optional DHCP server, and optional NAT — so Ethernet clients need no special configuration and get transparent Internet access.
 
-```
-                    upstream WiFi network
-                    (hotel, office, home AP)
-                            |
-                     [ WiFi STA uplink ]
-                      192.168.1.x / DHCP
-                      or static IP
-                            |
-               +------------+------------+
-               |     WT32-ETH01          |
-               |     ESP32 Ethernet      |
-               |         Router          |
-               |                         |
-               |  NAT / Routing          |
-               |  DHCP server            |
-               |  Firewall (ACL)         |
-               |  WireGuard VPN client   |
-               |  Packet capture (PCAP)  |
-               +------------+------------+
-                            |
-                     [ Ethernet LAN ]
-                      192.168.4.x
-                      (default subnet)
-                            |
-              +-------------+-------------+
-              |             |             |
-          [PC / Server] [Lab device] [Other host]
-```
+<img src="https://raw.githubusercontent.com/martin-ger/esp32_ethernet_router/refs/heads/main/esp32_ethernet_router_topo.png">
 
 All traffic from Ethernet clients is NATed through the router's WiFi uplink address by default, so the upstream network sees only a single client. NAT can be disabled for routed (non-NATed) operation if the upstream network knows the `192.168.4.0/24` subnet. A WireGuard VPN tunnel can optionally replace or supplement the direct uplink path, with a kill switch that blocks unprotected traffic when the tunnel is down.
 
@@ -44,10 +17,10 @@ All settings are managed through a browser-based web interface (accessible at `h
 ## Use Cases
 
 - **Home lab gateway** — connect a wired lab segment to a WiFi network without a dedicated router
-- **Travel router** — bridge hotel or shared WiFi to a private wired LAN with NAT and firewall
-- **Isolated test network** — provide controlled Internet access to a bench with optional kill-switch VPN
+- **Isolated test network** — provide controlled Internet access to an IoT net segment protected by ACLs
 - **Transparent monitoring tap** — capture and inspect all traffic on the wired segment in Wireshark without any client changes
 - **WPA2-Enterprise bridge** — give plain devices access to a corporate WiFi that requires 802.1X authentication
+- **VPN Gateway** — connect a LAN segment upstream via a protected VPN tunnel
 - **Routed segment (no NAT)** — operate as a pure IP router, forwarding traffic between the WiFi uplink and the Ethernet segment without address translation
 
 ---
@@ -106,6 +79,8 @@ Access the web interface from any device connected to the Ethernet LAN. The defa
 **/ — Status**
 
 Shows current connection state: uplink SSID, uplink IP, signal strength, Ethernet IP, VPN status (when a tunnel is configured), packet capture mode (when active), byte counters, and uptime. When a web password is set, the login form appears here.
+
+<img src="https://raw.githubusercontent.com/martin-ger/esp32_ethernet_router/refs/heads/main/UI_index.png">
 
 **Configuration**
 
