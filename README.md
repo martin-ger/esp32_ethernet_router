@@ -295,7 +295,7 @@ A TCP server provides a password-authenticated CLI session accessible over the n
 remote_console enable
 remote_console disable
 remote_console port <port>
-remote_console bind <eth|sta|vpn|both>
+remote_console bind <eth|sta|vpn[,...]>
 remote_console timeout <seconds>
 remote_console kick
 remote_console status
@@ -309,7 +309,7 @@ nc 192.168.4.1 2323
 
 The service is disabled by default. A web password must be set before enabling it. Idle sessions are disconnected after the configured timeout (default 300 seconds; 0 disables the timeout). Only one session is active at a time.
 
-The `bind` option controls which network interfaces the server listens on (ETH = Ethernet downlink, STA = WiFi uplink, VPN = WireGuard tunnel).
+The `bind` option controls which network interfaces the server listens on (ETH = Ethernet downlink, STA = WiFi uplink, VPN = WireGuard tunnel). Multiple interfaces can be specified comma-separated, e.g. `eth,sta`.
 
 ---
 
@@ -335,6 +335,8 @@ Connect via serial at 115200 bps, or via the remote console.
 
 | Command | Description |
 |---------|-------------|
+| `show config` | WiFi and Ethernet configuration |
+| `scan` | Scan for WiFi networks |
 | `set_sta <ssid> <password>` | Set upstream WiFi credentials |
 | `set_sta_static <ip> <mask> <gw>` | Set static IP for WiFi uplink |
 | `set_sta_static dhcp` | Revert WiFi uplink to DHCP |
@@ -349,11 +351,13 @@ Connect via serial at 115200 bps, or via the remote console.
 | `set_tz <TZ string>` | Set POSIX timezone |
 | `bytes` | Show uplink byte counters |
 | `bytes reset` | Reset byte counters |
+| `ping <host>` | Send ICMP echo requests |
 
 ### DHCP and Port Mapping
 
 | Command | Description |
 |---------|-------------|
+| `show mappings` | DHCP pool, reservations, port maps |
 | `dhcp_reserve add <mac> <ip> [-n <name>]` | Add DHCP reservation |
 | `dhcp_reserve del <mac>` | Remove DHCP reservation |
 | `portmap add <TCP\|UDP> <ext_port> <int_ip> <int_port>` | Add port forward rule |
@@ -402,10 +406,11 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 | `remote_console enable` | Enable remote console |
 | `remote_console disable` | Disable remote console |
 | `remote_console port <port>` | Set TCP port |
-| `remote_console bind <eth\|sta\|vpn\|both>` | Set interface binding |
+| `remote_console bind <eth\|sta\|vpn[,...]>` | Set interface binding (comma-separated) |
 | `remote_console timeout <seconds>` | Set idle timeout |
 | `remote_console kick` | Disconnect active session |
 | `remote_console status` | Show status |
+| `log_level [<level>] [-t <tag>]` | Get or set log level (none/error/warn/info/debug/verbose) |
 | `syslog enable <server> [<port>]` | Enable syslog forwarding |
 | `syslog disable` | Disable syslog forwarding |
 | `syslog status` | Show syslog configuration |
@@ -424,10 +429,20 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 | Command | Description |
 |---------|-------------|
 | `show status` | Connection state, IPs, heap |
-| `show config` | WiFi and Ethernet configuration |
-| `show mappings` | DHCP pool, reservations, port maps |
-| `scan` | Scan for WiFi networks |
+| `version` | Chip model, IDF version, flash size |
+| `heap` | Current and minimum free heap |
+| `tasks` | FreeRTOS task list |
+| `restart` | Software reset |
 | `factory_reset` | Erase all NVS settings and reboot |
+| `deep_sleep [-t <ms>] [--io <gpio> --io_level <0\|1>]` | Enter deep sleep |
+| `light_sleep [-t <ms>] [--io <gpio> --io_level <0\|1>]` | Enter light sleep |
+
+### Hardware
+
+| Command | Description |
+|---------|-------------|
+| `set_led_gpio <gpio\|none>` | Set GPIO for status LED |
+| `set_led_lowactive <true\|false>` | Invert LED polarity (active-low LEDs) |
 
 ---
 
