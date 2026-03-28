@@ -8,3 +8,6 @@ idf_component_register(
     REQUIRES lwip esp_netif esp_timer
     PRIV_REQUIRES nvs_flash cmd_router
 )
+
+# Performance optimization for hot-path packet filtering
+target_compile_options(${COMPONENT_LIB} PRIVATE -O2)

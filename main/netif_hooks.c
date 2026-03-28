@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include <time.h>
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -44,7 +45,7 @@ static struct netif *dl_netif = NULL;
 // Per-client traffic statistics for downlink clients
 static client_stats_entry_t client_stats[CLIENT_STATS_MAX];
 
-static inline client_stats_entry_t* find_client_stats(const uint8_t *mac) {
+static inline IRAM_ATTR client_stats_entry_t* find_client_stats(const uint8_t *mac) {
     for (int i = 0; i < CLIENT_STATS_MAX; i++) {
         if (client_stats[i].active && memcmp(client_stats[i].mac, mac, 6) == 0) {
             return &client_stats[i];
@@ -124,7 +125,7 @@ void format_bytes_human(uint64_t bytes, char *buf, size_t len) {
 }
 
 // Hook function to count received bytes via netif input and ACL check
-static err_t netif_input_hook(struct pbuf *p, struct netif *netif) {
+static IRAM_ATTR err_t netif_input_hook(struct pbuf *p, struct netif *netif) {
     bool is_acl_monitored = false;
 
     // Check to_esp ACL (packets from Internet to ESP32)
@@ -172,7 +173,7 @@ static err_t netif_input_hook(struct pbuf *p, struct netif *netif) {
 
 
 // Hook function to count sent bytes via netif linkoutput and ACL check
-static err_t netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
+static IRAM_ATTR err_t netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
     bool is_acl_monitored = false;
 
     // Check from_esp ACL (packets from ESP32 to Internet)
@@ -329,7 +330,7 @@ void format_boot_time(char *buf, size_t buf_len) {
 // Clamp the TCP MSS option in a SYN packet to max_mss.
 // Operates on raw Ethernet frames (14-byte header + IPv4 + TCP).
 // Updates the TCP checksum incrementally (RFC 1624).
-static void clamp_tcp_mss(struct pbuf *p, uint16_t max_mss) {
+static IRAM_ATTR void clamp_tcp_mss(struct pbuf *p, uint16_t max_mss) {
     if (max_mss == 0 || p == NULL) return;
     // Need at least Ethernet(14) + min IP(20) + min TCP(20) in the first segment
     if (p->len < 14 + 20 + 20) return;
@@ -469,7 +470,7 @@ static void send_icmp_frag_needed(struct pbuf *p, struct netif *netif, uint16_t 
 }
 
 // Downlink netif hook functions (for PCAP capture and ACL)
-static err_t dl_netif_input_hook(struct pbuf *p, struct netif *netif) {
+static IRAM_ATTR err_t dl_netif_input_hook(struct pbuf *p, struct netif *netif) {
     bool is_acl_monitored = false;
 
     // Check from_eth ACL (packets from Clients to ESP32)
@@ -549,7 +550,7 @@ static err_t dl_netif_input_hook(struct pbuf *p, struct netif *netif) {
     return ERR_VAL;
 }
 
-static err_t dl_netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
+static IRAM_ATTR err_t dl_netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
     bool is_acl_monitored = false;
 
     // Check to_eth ACL (packets from ESP32 to Clients)

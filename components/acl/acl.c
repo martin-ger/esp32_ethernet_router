@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
@@ -70,21 +71,21 @@ void acl_init(void)
     ESP_LOGI(TAG, "ACL subsystem initialized");
 }
 
-void acl_lock(void)
+IRAM_ATTR void acl_lock(void)
 {
     if (acl_mutex != NULL) {
         xSemaphoreTake(acl_mutex, portMAX_DELAY);
     }
 }
 
-void acl_unlock(void)
+IRAM_ATTR void acl_unlock(void)
 {
     if (acl_mutex != NULL) {
         xSemaphoreGive(acl_mutex);
     }
 }
 
-bool acl_is_empty(uint8_t acl_no)
+IRAM_ATTR bool acl_is_empty(uint8_t acl_no)
 {
     if (acl_no >= MAX_ACL_LISTS) {
         return true;
@@ -228,7 +229,7 @@ bool acl_delete(uint8_t acl_no, uint8_t rule_idx)
 #define ETH_TYPE_ARP   0x0806
 #define ETH_TYPE_IPV6  0x86DD
 
-uint8_t acl_check_packet(uint8_t acl_no, struct pbuf *p)
+IRAM_ATTR uint8_t acl_check_packet(uint8_t acl_no, struct pbuf *p)
 {
     if (acl_no >= MAX_ACL_LISTS || p == NULL) {
         return ACL_NO_MATCH;
