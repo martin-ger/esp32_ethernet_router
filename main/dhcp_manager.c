@@ -188,6 +188,18 @@ uint32_t lookup_dhcp_reservation(const uint8_t *mac) {
 }
 
 
+bool is_ip_reserved_for_other(uint32_t ip, const uint8_t *mac) {
+    if (ip == 0) return false;
+    for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
+        if (dhcp_reservations[i].valid &&
+            dhcp_reservations[i].ip == ip &&
+            memcmp(dhcp_reservations[i].mac, mac, 6) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const char* lookup_device_name_by_ip(uint32_t ip) {
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         if (dhcp_reservations[i].valid &&
