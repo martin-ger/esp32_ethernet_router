@@ -38,6 +38,10 @@
 #include "esp_wifi.h"
 #include "esp_eap_client.h"
 #include "esp_eth.h"
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+#include "driver/spi_master.h"
+#include "esp_eth_mac_spi.h"
+#endif
 
 #include "lwip/opt.h"
 #include "lwip/err.h"
@@ -403,7 +407,41 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     // --- Ethernet downlink with DHCP server ---
-    // Power on LAN8720 PHY via GPIO before EMAC init (WT32-ETH01)
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+    // W5500 SPI Ethernet (ESP32-C3 SuperMini)
+    spi_bus_config_t buscfg = {
+        .miso_io_num   = CONFIG_ETH_SPI_MISO_GPIO,
+        .mosi_io_num   = CONFIG_ETH_SPI_MOSI_GPIO,
+        .sclk_io_num   = CONFIG_ETH_SPI_SCLK_GPIO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(CONFIG_ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+    spi_device_interface_config_t devcfg = {
+        .command_bits     = 16,   // W5500 SPI frame: 16-bit address + 8-bit control
+        .address_bits     = 8,
+        .mode             = 0,
+        .clock_speed_hz   = CONFIG_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
+        .spics_io_num     = CONFIG_ETH_SPI_CS_GPIO,
+        .queue_size       = 20,
+        .cs_ena_pretrans  = 3,    // Required setup time for W5500
+        .cs_ena_posttrans = 3,
+    };
+
+    eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(CONFIG_ETH_SPI_HOST, &devcfg);
+    w5500_config.int_gpio_num = CONFIG_ETH_SPI_INT_GPIO;
+
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    esp_eth_mac_t *eth_mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
+
+    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+    phy_config.reset_gpio_num = CONFIG_ETH_SPI_RST_GPIO;   // GPIO2 drives W5500 RST
+    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_config);
+
+#else
+    // Internal EMAC + LAN8720 (WT32-ETH01)
+    // Power on LAN8720 PHY via GPIO before EMAC init
 #if CONFIG_ETH_PHY_POWER_GPIO >= 0
     gpio_config_t phy_power_cfg = {
         .pin_bit_mask = (1ULL << CONFIG_ETH_PHY_POWER_GPIO),
@@ -416,14 +454,15 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
 
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
     eth_esp32_emac_config_t emac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
-    emac_config.smi_gpio.mdc_num = CONFIG_ETH_MDC_GPIO;
+    emac_config.smi_gpio.mdc_num  = CONFIG_ETH_MDC_GPIO;
     emac_config.smi_gpio.mdio_num = CONFIG_ETH_MDIO_GPIO;
     esp_eth_mac_t *eth_mac = esp_eth_mac_new_esp32(&emac_config, &mac_config);
 
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
-    phy_config.phy_addr = CONFIG_ETH_PHY_ADDR;
-    phy_config.reset_gpio_num = -1;  // Don't use PHY reset - we handle power via GPIO above
+    phy_config.phy_addr       = CONFIG_ETH_PHY_ADDR;
+    phy_config.reset_gpio_num = -1;  // Power handled via GPIO above
     esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_config);
+#endif  // CONFIG_ETH_DOWNLINK_W5500
 
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(eth_mac, phy);
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));

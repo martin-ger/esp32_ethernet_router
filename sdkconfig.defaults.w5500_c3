@@ -1,0 +1,36 @@
+# W5500 SPI Ethernet + ESP32-C3 SuperMini
+#
+# Wiring:
+#   W5500 MISO  -> GPIO5   W5500 MOSI  -> GPIO6
+#   W5500 SCLK  -> GPIO4   W5500 CS    -> GPIO7
+#   W5500 INT   -> GPIO3   W5500 RST   -> GPIO2
+#
+# Build:
+#   idf.py set-target esp32c3
+#   idf.py -B build_w5500_c3 \
+#     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_c3" \
+#     build
+
+# Select W5500 downlink driver
+CONFIG_ETH_DOWNLINK_W5500=y
+
+# Enable W5500 SPI Ethernet driver in ESP-IDF
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
+
+# W5500 pin assignments
+CONFIG_ETH_SPI_HOST=1
+CONFIG_ETH_SPI_MISO_GPIO=5
+CONFIG_ETH_SPI_MOSI_GPIO=6
+CONFIG_ETH_SPI_SCLK_GPIO=4
+CONFIG_ETH_SPI_CS_GPIO=7
+CONFIG_ETH_SPI_INT_GPIO=3
+CONFIG_ETH_SPI_RST_GPIO=2
+CONFIG_ETH_SPI_CLOCK_MHZ=25
+
+# ESP32-C3 max CPU frequency is 160 MHz (no 240 MHz option)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240 is not set
+
+# ESP32-C3 SuperMini console: USB Serial/JTAG (built-in USB)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
