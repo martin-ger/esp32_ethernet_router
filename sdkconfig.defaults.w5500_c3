@@ -6,8 +6,8 @@
 #   W5500 INT   -> GPIO3   W5500 RST   -> GPIO2
 #
 # Build:
-#   idf.py set-target esp32c3
-#   idf.py -B build_w5500_c3 \
+#   idf.py set-target esp32c3 -B build_w5500_c3 \
+#     -D SDKCONFIG=sdkconfig.w5500_c3 \
 #     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_c3" \
 #     build
 

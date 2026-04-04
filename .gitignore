@@ -2,8 +2,10 @@
 build/
 build_*/
 
-# Generated sdkconfig (sdkconfig.defaults is the source of truth)
+# Generated sdkconfig files (sdkconfig.defaults* are the source of truth)
 sdkconfig
+sdkconfig.w5500_c3
+sdkconfig.wt32
 
 # Managed components (fetched by idf component manager)
 managed_components/
