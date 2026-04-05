@@ -1,6 +1,6 @@
 # ESP32 Ethernet Router
 
-Firmware for the **[WT32-ETH01](https://github.com/egnor/wt32-eth01)** board that turns it into a compact network router. 
+Firmware for the **[WT32-ETH01](https://github.com/egnor/wt32-eth01)** board (and boards with a W5500 ethernet module) that turns it into a compact network router. 
 
 **Derived from** [esp32_nat_router](https://github.com/martin-ger/esp32_nat_router). The original project uses WiFi as the downlink (AP) and (as one option) Ethernet as the uplink. This variant reverses that: **WiFi STA is the uplink** (Internet) and **Ethernet is the downlink** (LAN). If you are looking for a plain ESP32 **Ethernet AP** (Layer 2 bridge), check out [esp32_eth_wifi_bridge](https://github.com/martin-ger/esp32_eth_wifi_bridge).
 
@@ -72,7 +72,10 @@ The WT32-ETH01 is an ESP32-based module with an integrated LAN8720 Ethernet PHY.
 
 ## Hardware — W5500 + ESP32-C3
 
-As an alternative to the WT32-ETH01, the router can run on an **ESP32-C3 SuperMini** (or any ESP32-C3 board) with an external **W5500 SPI Ethernet module**.
+As an alternative to the WT32-ETH01, the router can run on an **ESP32-C3 SuperMini** (or any ESP32-C3 board) with an external **W5500 SPI Ethernet module**. There are no precompiled binaries for this setup as the boards and possible setups vary a lot - a single binary won't cover that.
+
+**Caution:** The WiFi signal strength is often critical on the tiny SuperMini boards due to antenna issues. Typical symptoms can be, that you cannot connect to an AP correctly, even if you see it in a scan. 
+Look in the internet for possible DIY antenna fixes.
 
 | Parameter | Value |
 |-----------|-------|
@@ -82,6 +85,10 @@ As an alternative to the WT32-ETH01, the router can run on an **ESP32-C3 SuperMi
 | Console | USB-JTAG (SuperMini) or UART (DevKit-M-1) |
 
 ### Wiring
+
+All pin assignments are configurable via `idf.py menuconfig` → *Ethernet Downlink*.
+
+The following setup is known to work:
 
 | W5500 Pin | ESP32-C3 GPIO | Function |
 |-----------|---------------|----------|
@@ -94,7 +101,7 @@ As an alternative to the WT32-ETH01, the router can run on an **ESP32-C3 SuperMi
 | INT | GPIO 3 | Interrupt |
 | RST | GPIO 2 | Hardware Reset |
 
-All pin assignments are configurable via `idf.py menuconfig` → *Ethernet Downlink*.
+<img src="https://raw.githubusercontent.com/martin-ger/esp32_ethernet_router/refs/heads/main/W5500-ESP32C3.png">
 
 ### Build
 
@@ -116,9 +123,11 @@ idf.py -B build_w5500_c3 -p /dev/ttyUSB0 flash monitor   # DevKit-M-1 (UART)
 
 ### Notes
 
+- You may adapt the settings via `menuconfig` or directly in sdkconfig.defaults.w5500_c3 to adapt for other ESP32 types and boards with a W5500.
+- The W5500 draws up to 250 mA, way to much for the SuperMini's voltage regulator. Use external power supply.
 - The W5500 module has no factory MAC address. The firmware derives one automatically from the ESP32-C3's base MAC.
-- GPIO 2 is used for W5500 reset, so it is not available as a status LED. The onboard LED on the SuperMini (typically GPIO 8) can be configured via `set_led_gpio 8`.
-- SPI clock defaults to 20 MHz. Increase via `menuconfig` if wiring is short and clean; decrease if you see SPI errors.
+- The onboard LED on the SuperMini (typically GPIO 8) can be configured via `set_led_gpio 8`.
+- SPI clock defaults to 25 MHz. Increase via `menuconfig` if wiring is short and clean; decrease if you see SPI errors.
 - WiFi power saving is disabled in this variant to improve throughput on the single-core C3.
 
 ---
