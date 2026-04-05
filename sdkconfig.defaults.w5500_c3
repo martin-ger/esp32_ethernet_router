@@ -26,11 +26,25 @@ CONFIG_ETH_SPI_SCLK_GPIO=4
 CONFIG_ETH_SPI_CS_GPIO=7
 CONFIG_ETH_SPI_INT_GPIO=3
 CONFIG_ETH_SPI_RST_GPIO=2
-CONFIG_ETH_SPI_CLOCK_MHZ=25
+CONFIG_ETH_SPI_CLOCK_MHZ=20
 
 # ESP32-C3 max CPU frequency is 160 MHz (no 240 MHz option)
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
 # CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240 is not set
 
-# ESP32-C3 SuperMini console: USB Serial/JTAG (built-in USB)
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# W5500 SPI polling starves IDLE task on single-core C3 — don't watch it
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+
+# --- Performance: IRAM placement for hot-path code ---
+# SPI master: put polling/ISR functions in IRAM (avoids flash cache misses
+# during W5500 transfers that compete with WiFi for the cache)
+CONFIG_SPI_MASTER_IN_IRAM=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+
+# lwIP: packet processing hot path in IRAM
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+
+# Optimize for speed instead of size (overrides base sdkconfig.defaults)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# CONFIG_COMPILER_OPTIMIZATION_SIZE is not set
+

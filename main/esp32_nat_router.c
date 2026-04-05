@@ -18,6 +18,7 @@
 #include <time.h>
 #include <pthread.h>
 #include "esp_system.h"
+#include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_console.h"
@@ -409,6 +410,9 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     // --- Ethernet downlink with DHCP server ---
 #if defined(CONFIG_ETH_DOWNLINK_W5500)
     // W5500 SPI Ethernet (ESP32-C3 SuperMini)
+    // GPIO ISR service required by the W5500 INT pin handler
+    gpio_install_isr_service(0);
+
     spi_bus_config_t buscfg = {
         .miso_io_num   = CONFIG_ETH_SPI_MISO_GPIO,
         .mosi_io_num   = CONFIG_ETH_SPI_MOSI_GPIO,
@@ -419,14 +423,14 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     ESP_ERROR_CHECK(spi_bus_initialize(CONFIG_ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     spi_device_interface_config_t devcfg = {
-        .command_bits     = 16,   // W5500 SPI frame: 16-bit address + 8-bit control
-        .address_bits     = 8,
-        .mode             = 0,
-        .clock_speed_hz   = CONFIG_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
-        .spics_io_num     = CONFIG_ETH_SPI_CS_GPIO,
-        .queue_size       = 20,
-        .cs_ena_pretrans  = 3,    // Required setup time for W5500
-        .cs_ena_posttrans = 3,
+        .command_bits  = 16,  // W5500 SPI frame: 16-bit offset address
+        .address_bits  = 8,   // W5500 SPI frame: 8-bit control byte
+        .mode          = 0,
+        .clock_speed_hz = CONFIG_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
+        .spics_io_num  = CONFIG_ETH_SPI_CS_GPIO,
+        .queue_size    = 20,
+        // cs_ena_pretrans/posttrans intentionally omitted:
+        // not supported for full-duplex SPI and corrupts transactions
     };
 
     eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(CONFIG_ETH_SPI_HOST, &devcfg);
@@ -466,6 +470,18 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
 
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(eth_mac, phy);
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
+
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+    // W5500 modules often lack a factory MAC — derive one from the chip's base MAC
+    {
+        uint8_t eth_mac_addr[6];
+        ESP_ERROR_CHECK(esp_read_mac(eth_mac_addr, ESP_MAC_ETH));
+        ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, eth_mac_addr));
+        ESP_LOGI(TAG, "W5500 MAC set to %02x:%02x:%02x:%02x:%02x:%02x",
+                 eth_mac_addr[0], eth_mac_addr[1], eth_mac_addr[2],
+                 eth_mac_addr[3], eth_mac_addr[4], eth_mac_addr[5]);
+    }
+#endif
 
     // Configure Ethernet netif with static IP (and optionally DHCP server)
     my_ap_ip = esp_ip4addr_aton(ap_ip);
@@ -593,6 +609,10 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
         pdFALSE, pdTRUE, pdMS_TO_TICKS(JOIN_TIMEOUT_MS));
     ESP_ERROR_CHECK(esp_wifi_start());
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+    // Single-core C3: disable WiFi power saving to reduce TX latency
+    esp_wifi_set_ps(WIFI_PS_NONE);
+#endif
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
     if (strlen(ssid) > 0) {
