@@ -12,3 +12,10 @@ CONFIG_ETH_USE_ESP32_EMAC=y
 
 # ESP32 supports 240 MHz
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# --- Performance: optimize for speed instead of size ---
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# CONFIG_COMPILER_OPTIMIZATION_SIZE is not set
+
+# lwIP packet processing hot path in IRAM
+CONFIG_LWIP_IRAM_OPTIMIZATION=y

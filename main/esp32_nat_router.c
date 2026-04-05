@@ -428,7 +428,7 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
         .mode          = 0,
         .clock_speed_hz = CONFIG_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
         .spics_io_num  = CONFIG_ETH_SPI_CS_GPIO,
-        .queue_size    = 20,
+        .queue_size    = 4,  // W5500 driver sends one frame at a time; 20 wastes DMA SRAM
         // cs_ena_pretrans/posttrans intentionally omitted:
         // not supported for full-duplex SPI and corrupts transactions
     };
