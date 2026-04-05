@@ -536,7 +536,7 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
         .mode          = 0,
         .clock_speed_hz = CONFIG_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
         .spics_io_num  = CONFIG_ETH_SPI_CS_GPIO,
-        .queue_size    = 4,  // W5500 driver sends one frame at a time; 20 wastes DMA SRAM
+        .queue_size    = 4,  // W5500 driver sends one frame at a time; more wastes DMA SRAM
         // cs_ena_pretrans/posttrans intentionally omitted:
         // not supported for full-duplex SPI and corrupts transactions
     };
@@ -552,6 +552,10 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     w5500_config.custom_spi_driver.write  = w5500_custom_spi_write;
 
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    // Raise RX task priority to match lwIP (default is 15, lwIP is 18).
+    // On single-core C3 the RX task does 4+ SPI reads per frame; running below
+    // lwIP and WiFi meant it was frequently preempted mid-read, throttling ETH→WiFi.
+    mac_config.rx_task_prio = 18;
     esp_eth_mac_t *eth_mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
 
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
