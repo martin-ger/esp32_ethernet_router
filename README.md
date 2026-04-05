@@ -520,14 +520,10 @@ idf.py -B build_eth_sta menuconfig
 
 ```bash
 . $IDF_PATH/export.sh
-idf.py set-target esp32c3
-idf.py -B build_w5500_c3 \
-  -D SDKCONFIG=sdkconfig.w5500_c3 \
-  -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_c3" \
-  build
+./build_firmware_w5500_c3.sh
 ```
 
-To reconfigure build options:
+The script performs a clean build and copies the four binary files into the `firmware_w5500_c3/` directory. To reconfigure build options:
 
 ```bash
 idf.py -B build_w5500_c3 menuconfig
@@ -549,6 +545,8 @@ OTA updates are also supported through the web interface (Device Management sect
 
 ## Installation
 
+### WT32-ETH01 (ESP32)
+
 Flash the binaries from the `firmware/` directory using `esptool.py`:
 
 ```bash
@@ -560,24 +558,47 @@ esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 460800 \
   0x20000 firmware/esp32_eth_router.bin
 ```
 
-After flashing, connect via serial at 115200 bps and configure the upstream WiFi:
+To wipe the entire flash:
+
+```bash
+esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
+```
+
+### W5500 + ESP32-C3
+
+Flash the binaries from the `firmware_w5500_c3/` directory:
+
+```bash
+esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 460800 \
+  write_flash \
+  0x0000  firmware_w5500_c3/bootloader.bin \
+  0x8000  firmware_w5500_c3/partition-table.bin \
+  0xf000  firmware_w5500_c3/ota_data_initial.bin \
+  0x20000 firmware_w5500_c3/esp32_eth_router.bin
+```
+
+Note: use `/dev/ttyUSB0` for a DevKit-M-1 (UART) or `/dev/ttyACM0` for a SuperMini (USB-JTAG). The ESP32-C3 bootloader address is `0x0000`, not `0x1000` — using the wrong address will require a full flash erase to recover.
+
+To wipe the entire flash:
+
+```bash
+esptool.py --chip esp32c3 --port /dev/ttyACM0 erase_flash
+```
+
+### First Boot
+
+After flashing either variant, connect via serial at 115200 bps and configure the upstream WiFi:
 
 ```
 set_sta MyWiFiSSID MyPassword
 ```
 
-The router will reboot and connect. Access the web interface at `http://192.168.4.1` from a device connected to the Ethernet port or via WiFi at the assigned IP.
+The router will reboot and connect. Access the web interface at `http://192.168.4.1` from a device connected to the Ethernet port.
 
 To erase all settings and return to defaults:
 
 ```
 factory_reset
-```
-
-or via esptool to wipe the entire flash:
-
-```bash
-esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
 ```
 
 

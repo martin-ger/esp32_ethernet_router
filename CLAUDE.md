@@ -4,19 +4,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ESP32 Ethernet Router (`ETH_STA_Uplink` branch) - Firmware for the WT32-ETH01 board where **WiFi STA is the uplink** (Internet) and **Ethernet is the downlink** (LAN). This is the inverse of the original ESP32 NAT Router topology. Supports NAT routing, DHCP server, VPN/WireGuard, ACL firewall, DHCP reservations, and port mapping.
+ESP32 Ethernet Router - Firmware where **WiFi STA is the uplink** (Internet) and **Ethernet is the downlink** (LAN). This is the inverse of the original ESP32 NAT Router topology. Supports NAT routing, DHCP server, VPN/WireGuard, ACL firewall, DHCP reservations, and port mapping.
+
+**Supported hardware variants:**
+- **WT32-ETH01** — ESP32 (dual-core, 240 MHz) with built-in LAN8720 Ethernet PHY
+- **W5500 + ESP32-C3 SuperMini** — ESP32-C3 (single-core RISC-V, 160 MHz) with W5500 SPI Ethernet module
+
+Both variants share all router logic. The only divergence is Ethernet MAC/PHY initialization, selected at build time via Kconfig (`CONFIG_ETH_DOWNLINK_EMAC` vs `CONFIG_ETH_DOWNLINK_W5500`).
 
 ## Build Commands
 
-### ESP-IDF (Primary)
+### WT32-ETH01 (ESP32 + LAN8720)
 ```bash
-idf.py set-target esp32           # Target is ESP32 (WT32-ETH01)
-idf.py menuconfig                 # Configure build options
-idf.py -B build_eth_sta build     # Build (use dedicated build dir)
-idf.py -B build_eth_sta flash     # Flash to device
-idf.py -B build_eth_sta monitor   # Watch serial output (115200 bps)
-idf.py -B build_eth_sta flash monitor  # Flash and monitor combined
+./build_firmware.sh               # Clean build → firmware/
+idf.py -B build_eth_sta menuconfig
+idf.py -B build_eth_sta build
+idf.py -B build_eth_sta flash monitor   # 115200 bps
 ```
+
+### W5500 + ESP32-C3
+```bash
+./build_firmware_w5500_c3.sh      # Clean build → firmware_w5500_c3/
+idf.py -B build_w5500_c3 menuconfig
+idf.py -B build_w5500_c3 \
+  -D SDKCONFIG=sdkconfig.w5500_c3 \
+  -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_c3" \
+  build
+idf.py -B build_w5500_c3 -p /dev/ttyACM0 flash monitor   # SuperMini (USB-JTAG)
+```
+
+**Note:** Each variant uses a separate build directory and sdkconfig file to avoid conflicts. Always pass `-D SDKCONFIG=sdkconfig.w5500_c3` for the W5500 build or it will overwrite the default `sdkconfig`.
 
 ## Architecture
 
@@ -385,7 +402,9 @@ ap_netif_linkoutput_hook(netif, pbuf) // Currently pass-through
 - `sta_reconnect()` calls `esp_wifi_connect()` directly
 - Reconnect is paused during WiFi scanning
 
-## LED Status (GPIO 2)
+## LED Status
 - Solid on: Connected to upstream WiFi AP
 - Solid off: Not connected
 - Blinking: Active (blink pattern indicates connection state)
+
+LED is off (-1) by default.
