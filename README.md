@@ -70,6 +70,59 @@ The WT32-ETH01 is an ESP32-based module with an integrated LAN8720 Ethernet PHY.
 
 ---
 
+## Hardware — W5500 + ESP32-C3
+
+As an alternative to the WT32-ETH01, the router can run on an **ESP32-C3 SuperMini** (or any ESP32-C3 board) with an external **W5500 SPI Ethernet module**.
+
+| Parameter | Value |
+|-----------|-------|
+| SoC | ESP32-C3 (single-core RISC-V, 160 MHz) |
+| Flash | 4 MB |
+| Ethernet | W5500 (SPI, 10/100 Mbit/s) |
+| Console | USB-JTAG (SuperMini) or UART (DevKit-M-1) |
+
+### Wiring
+
+| W5500 Pin | ESP32-C3 GPIO | Function |
+|-----------|---------------|----------|
+| GND | GND | Ground |
+| 3.3V / VCC | 3V3 | Power |
+| MISO | GPIO 5 | SPI Data In |
+| MOSI | GPIO 6 | SPI Data Out |
+| SCLK | GPIO 4 | SPI Clock |
+| SCS (CS) | GPIO 7 | SPI Chip Select |
+| INT | GPIO 3 | Interrupt |
+| RST | GPIO 2 | Hardware Reset |
+
+All pin assignments are configurable via `idf.py menuconfig` → *Ethernet Downlink*.
+
+### Build
+
+```bash
+. $IDF_PATH/export.sh
+idf.py set-target esp32c3
+idf.py -B build_w5500_c3 \
+  -D SDKCONFIG=sdkconfig.w5500_c3 \
+  -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_c3" \
+  build
+```
+
+### Flash
+
+```bash
+idf.py -B build_w5500_c3 -p /dev/ttyACM0 flash monitor   # SuperMini (USB-JTAG)
+idf.py -B build_w5500_c3 -p /dev/ttyUSB0 flash monitor   # DevKit-M-1 (UART)
+```
+
+### Notes
+
+- The W5500 module has no factory MAC address. The firmware derives one automatically from the ESP32-C3's base MAC.
+- GPIO 2 is used for W5500 reset, so it is not available as a status LED. The onboard LED on the SuperMini (typically GPIO 8) can be configured via `set_led_gpio 8`.
+- SPI clock defaults to 20 MHz. Increase via `menuconfig` if wiring is short and clean; decrease if you see SPI errors.
+- WiFi power saving is disabled in this variant to improve throughput on the single-core C3.
+
+---
+
 ## Web Interface
 
 Access the web interface from any device connected to the Ethernet LAN. The default address is `http://192.168.4.1`.
@@ -448,30 +501,47 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 
 ## Building
 
-Requires ESP-IDF v5.x. Source the ESP-IDF environment, then run the provided build script:
+Requires ESP-IDF v5.x. Source the ESP-IDF environment, then build for your target hardware.
+
+### WT32-ETH01 (ESP32 + LAN8720)
 
 ```bash
 . $IDF_PATH/export.sh
 ./build_firmware.sh
 ```
 
-The script performs a clean build and copies the four binary files into the `firmware/` directory:
-
-```
-firmware/
-├── bootloader.bin
-├── partition-table.bin
-├── ota_data_initial.bin
-└── esp32_eth_router.bin
-```
-
-To reconfigure build options before building:
+The script performs a clean build and copies the four binary files into the `firmware/` directory. To reconfigure build options:
 
 ```bash
 idf.py -B build_eth_sta menuconfig
 ```
 
-The `sdkconfig.defaults.wt32_eth_sta_uplink` file sets the Ethernet PHY GPIOs for the WT32-ETH01 (MDC=23, MDIO=18, PHY addr=1, PHY power=16). The base `sdkconfig.defaults` enables IP forwarding, NAPT, and the custom DHCP server with up to 16 leases.
+### W5500 + ESP32-C3
+
+```bash
+. $IDF_PATH/export.sh
+idf.py set-target esp32c3
+idf.py -B build_w5500_c3 \
+  -D SDKCONFIG=sdkconfig.w5500_c3 \
+  -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_c3" \
+  build
+```
+
+To reconfigure build options:
+
+```bash
+idf.py -B build_w5500_c3 menuconfig
+```
+
+### Configuration files
+
+| File | Purpose |
+|------|---------|
+| `sdkconfig.defaults` | Shared base config (IP forwarding, NAPT, DHCP server) |
+| `sdkconfig.defaults.wt32_eth_sta_uplink` | WT32-ETH01 Ethernet PHY GPIOs (LAN8720) |
+| `sdkconfig.defaults.w5500_c3` | W5500 SPI pins, ESP32-C3 specifics, IRAM/perf tuning |
+
+Each variant uses a separate sdkconfig file (`sdkconfig` vs `sdkconfig.w5500_c3`) so both can coexist in the same project directory.
 
 OTA updates are also supported through the web interface (Device Management section) with partition rollback on failed updates.
 
