@@ -26,6 +26,7 @@ rm -rf "$BUILD_DIR"
 
 # Build
 echo "--- Building ---"
+idf.py set-target esp32
 idf.py \
     -B "$BUILD_DIR" \
     -D SDKCONFIG_DEFAULTS="$SDKCONFIG" \

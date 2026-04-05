@@ -42,6 +42,7 @@
 #if defined(CONFIG_ETH_DOWNLINK_W5500)
 #include "driver/spi_master.h"
 #include "esp_eth_mac_spi.h"
+#include "esp_heap_caps.h"
 #endif
 
 #include "lwip/opt.h"
@@ -398,6 +399,113 @@ static void eth_downlink_event_handler(void* arg, esp_event_base_t event_base,
 const int CONNECTED_BIT = BIT0;
 #define JOIN_TIMEOUT_MS (2000)
 
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+/*
+ * Custom W5500 SPI driver with a pre-allocated DMA-aligned TX buffer.
+ *
+ * Root cause of the "Load access fault" crash: lwIP packet buffers are not
+ * guaranteed to be DMA-aligned, so the SPI master's setup_dma_priv_buffer()
+ * allocates a per-frame DMA bounce buffer from the heap on every TX call.
+ * Under sustained load this exhausts the DMA heap, the allocation fails,
+ * the driver's error recovery dereferences a NULL pointer, and the system
+ * crashes. By pre-allocating one aligned DMA buffer here and reusing it for
+ * every write, the per-frame heap allocation is eliminated entirely.
+ *
+ * The TX path is serialised by the SPI mutex, so a single shared buffer is safe.
+ */
+#define W5500_SPI_LOCK_TIMEOUT_MS 50
+#define W5500_TX_DMA_ALIGN        64    /* cache-line safe on all ESP32 variants */
+
+typedef struct {
+    spi_device_handle_t hdl;
+    SemaphoreHandle_t   lock;
+    uint8_t            *tx_dma_buf;
+} w5500_spi_ctx_t;
+
+static void *w5500_custom_spi_init(const void *cfg)
+{
+    const eth_w5500_config_t *w5500_cfg = (const eth_w5500_config_t *)cfg;
+    w5500_spi_ctx_t *ctx = calloc(1, sizeof(w5500_spi_ctx_t));
+    if (!ctx) return NULL;
+
+    // SPI bus is already initialized; just add our device.
+    if (spi_bus_add_device(w5500_cfg->spi_host_id, w5500_cfg->spi_devcfg, &ctx->hdl) != ESP_OK) {
+        free(ctx); return NULL;
+    }
+    ctx->lock = xSemaphoreCreateMutex();
+    if (!ctx->lock) { spi_bus_remove_device(ctx->hdl); free(ctx); return NULL; }
+
+    ctx->tx_dma_buf = heap_caps_aligned_alloc(W5500_TX_DMA_ALIGN, ETH_MAX_PACKET_SIZE,
+                                              MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!ctx->tx_dma_buf) {
+        vSemaphoreDelete(ctx->lock); spi_bus_remove_device(ctx->hdl); free(ctx); return NULL;
+    }
+    ESP_LOGI(TAG, "W5500 custom SPI driver: DMA TX buffer at %p", ctx->tx_dma_buf);
+    return ctx;
+}
+
+static esp_err_t w5500_custom_spi_deinit(void *spi_ctx)
+{
+    w5500_spi_ctx_t *ctx = spi_ctx;
+    heap_caps_free(ctx->tx_dma_buf);
+    vSemaphoreDelete(ctx->lock);
+    spi_bus_remove_device(ctx->hdl);
+    free(ctx);
+    return ESP_OK;
+}
+
+static esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr,
+                                        void *data, uint32_t len)
+{
+    w5500_spi_ctx_t *ctx = spi_ctx;
+    // Small register reads (≤4 bytes) use SPI_TRANS_USE_RXDATA (inline, no DMA needed).
+    // Larger reads land in emac->rx_buffer which is already MALLOC_CAP_DMA (allocated
+    // by the driver itself in esp_eth_mac_new_w5500), so no bounce buffer is needed.
+    spi_transaction_t t = {
+        .flags     = len <= 4 ? SPI_TRANS_USE_RXDATA : 0,
+        .cmd       = cmd,
+        .addr      = addr,
+        .length    = 8 * len,
+        .rx_buffer = data,
+    };
+    esp_err_t ret = ESP_FAIL;
+    if (xSemaphoreTake(ctx->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
+        if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) ret = ESP_OK;
+        xSemaphoreGive(ctx->lock);
+    } else {
+        ret = ESP_ERR_TIMEOUT;
+    }
+    if ((t.flags & SPI_TRANS_USE_RXDATA) && len <= 4) memcpy(data, t.rx_data, len);
+    return ret;
+}
+
+static esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr,
+                                         const void *data, uint32_t len)
+{
+    w5500_spi_ctx_t *ctx = spi_ctx;
+    // Copy into the pre-allocated DMA-aligned buffer so setup_dma_priv_buffer()
+    // in the SPI master driver sees an already-suitable pointer and skips the
+    // per-frame heap allocation that was causing DMA heap exhaustion.
+    assert(len <= ETH_MAX_PACKET_SIZE);
+    spi_transaction_t t = {
+        .cmd       = cmd,
+        .addr      = addr,
+        .length    = 8 * len,
+        .tx_buffer = ctx->tx_dma_buf,
+    };
+    esp_err_t ret = ESP_FAIL;
+    if (xSemaphoreTake(ctx->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
+        // memcpy inside the mutex: tx_dma_buf is shared, must not race
+        memcpy(ctx->tx_dma_buf, data, len);
+        if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) ret = ESP_OK;
+        xSemaphoreGive(ctx->lock);
+    } else {
+        ret = ESP_ERR_TIMEOUT;
+    }
+    return ret;
+}
+#endif // CONFIG_ETH_DOWNLINK_W5500
+
 void router_init(const uint8_t* mac, const char* ssid, const char* ent_username, const char* ent_identity, const char* passwd, const char* static_ip, const char* subnet_mask, const char* gateway_addr, const char* ap_ip)
 {
     esp_netif_dns_info_t dnsserver;
@@ -435,6 +543,13 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
 
     eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(CONFIG_ETH_SPI_HOST, &devcfg);
     w5500_config.int_gpio_num = CONFIG_ETH_SPI_INT_GPIO;
+    // Use custom SPI driver to pre-allocate a DMA-aligned TX buffer, eliminating
+    // the per-frame heap allocation that caused DMA heap exhaustion and crashes.
+    w5500_config.custom_spi_driver.config = &w5500_config;  // passed to init(), called synchronously
+    w5500_config.custom_spi_driver.init   = w5500_custom_spi_init;
+    w5500_config.custom_spi_driver.deinit = w5500_custom_spi_deinit;
+    w5500_config.custom_spi_driver.read   = w5500_custom_spi_read;
+    w5500_config.custom_spi_driver.write  = w5500_custom_spi_write;
 
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
     esp_eth_mac_t *eth_mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
