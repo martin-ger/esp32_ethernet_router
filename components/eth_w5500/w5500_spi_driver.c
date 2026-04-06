@@ -13,17 +13,29 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "esp_memory_utils.h"
 #include "w5500_spi_driver.h"
 
 static const char *TAG = "w5500.spi";
 
 #define W5500_SPI_LOCK_TIMEOUT_MS  50
-#define W5500_TX_DMA_ALIGN         64   /* cache-line safe on all ESP32 variants */
+#define W5500_DMA_ALIGN            64   /* cache-line safe on all ESP32 variants */
+
+// ESP32-C3 GDMA RX burst requires 4-byte aligned length
+// (GDMA_LL_AHB_RX_BURST_NEEDS_ALIGNMENT).  Round up RX transfer lengths so
+// setup_dma_priv_buffer() sees our buffer as suitable and skips heap allocation.
+// Only applied to reads — writes must use exact len or W5500 auto-increments
+// and corrupts adjacent registers.
+#define DMA_RX_ROUND_UP(n)  (((n) + 3) & ~3)
+
+// Buffer size: ETH_MAX_PACKET_SIZE rounded up to 4 bytes so rounded reads fit.
+#define W5500_DMA_BUF_SIZE  DMA_RX_ROUND_UP(ETH_MAX_PACKET_SIZE)
 
 typedef struct {
     spi_device_handle_t hdl;
     SemaphoreHandle_t   lock;
     uint8_t            *tx_dma_buf;
+    uint8_t            *rx_dma_buf;
 } w5500_spi_ctx_t;
 
 static void *w5500_custom_spi_init(const void *cfg)
@@ -39,18 +51,28 @@ static void *w5500_custom_spi_init(const void *cfg)
     ctx->lock = xSemaphoreCreateMutex();
     if (!ctx->lock) { spi_bus_remove_device(ctx->hdl); free(ctx); return NULL; }
 
-    ctx->tx_dma_buf = heap_caps_aligned_alloc(W5500_TX_DMA_ALIGN, ETH_MAX_PACKET_SIZE,
+    ctx->tx_dma_buf = heap_caps_aligned_alloc(W5500_DMA_ALIGN, W5500_DMA_BUF_SIZE,
                                               MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!ctx->tx_dma_buf) {
         vSemaphoreDelete(ctx->lock); spi_bus_remove_device(ctx->hdl); free(ctx); return NULL;
     }
-    ESP_LOGI(TAG, "DMA TX buffer at %p", ctx->tx_dma_buf);
+    ctx->rx_dma_buf = heap_caps_aligned_alloc(W5500_DMA_ALIGN, W5500_DMA_BUF_SIZE,
+                                              MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!ctx->rx_dma_buf) {
+        heap_caps_free(ctx->tx_dma_buf);
+        vSemaphoreDelete(ctx->lock); spi_bus_remove_device(ctx->hdl); free(ctx); return NULL;
+    }
+    ESP_LOGI(TAG, "DMA TX=%p RX=%p buf_size=%u tx_dma_ok=%d rx_dma_ok=%d",
+             ctx->tx_dma_buf, ctx->rx_dma_buf, W5500_DMA_BUF_SIZE,
+             esp_ptr_dma_capable(ctx->tx_dma_buf),
+             esp_ptr_dma_capable(ctx->rx_dma_buf));
     return ctx;
 }
 
 static esp_err_t w5500_custom_spi_deinit(void *spi_ctx)
 {
     w5500_spi_ctx_t *ctx = spi_ctx;
+    heap_caps_free(ctx->rx_dma_buf);
     heap_caps_free(ctx->tx_dma_buf);
     vSemaphoreDelete(ctx->lock);
     spi_bus_remove_device(ctx->hdl);
@@ -62,24 +84,35 @@ static esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t add
                                         void *data, uint32_t len)
 {
     w5500_spi_ctx_t *ctx = spi_ctx;
-    // Small register reads (≤4 bytes) use SPI_TRANS_USE_RXDATA (inline, no DMA needed).
-    // Larger reads land in emac->rx_buffer which is already MALLOC_CAP_DMA (allocated
-    // by the driver in esp_eth_mac_new_w5500), so no bounce buffer is needed there either.
+    // Small register reads (≤4 bytes): inline, no DMA.
+    // Larger reads: if the caller's buffer is DMA-capable AND the length is
+    // 4-byte aligned (GDMA RX burst requirement on C3), read directly into it
+    // (zero-copy).  Otherwise bounce through rx_dma_buf.
+    bool use_inline = (len <= 4);
+    bool direct_dma = !use_inline && esp_ptr_dma_capable(data) && ((((uintptr_t)data) | len) & 3) == 0;
+    uint32_t spi_len = use_inline ? len : DMA_RX_ROUND_UP(len);
     spi_transaction_t t = {
-        .flags     = len <= 4 ? SPI_TRANS_USE_RXDATA : 0,
+        .flags     = use_inline ? SPI_TRANS_USE_RXDATA : 0,
         .cmd       = cmd,
         .addr      = addr,
-        .length    = 8 * len,
-        .rx_buffer = data,
+        .length    = 8 * spi_len,
+        .rx_buffer = use_inline ? NULL : (direct_dma ? data : ctx->rx_dma_buf),
     };
     esp_err_t ret = ESP_FAIL;
     if (xSemaphoreTake(ctx->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
-        if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) ret = ESP_OK;
+        if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) {
+            if (use_inline) {
+                memcpy(data, t.rx_data, len);
+            } else if (!direct_dma) {
+                memcpy(data, ctx->rx_dma_buf, len);
+            }
+            // direct_dma: data already in caller's buffer, no copy needed
+            ret = ESP_OK;
+        }
         xSemaphoreGive(ctx->lock);
     } else {
         ret = ESP_ERR_TIMEOUT;
     }
-    if ((t.flags & SPI_TRANS_USE_RXDATA) && len <= 4) memcpy(data, t.rx_data, len);
     return ret;
 }
 
@@ -87,14 +120,16 @@ static esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t ad
                                          const void *data, uint32_t len)
 {
     w5500_spi_ctx_t *ctx = spi_ctx;
-    // Copy into the pre-allocated DMA-aligned buffer so setup_dma_priv_buffer()
-    // in the SPI master driver sees an already-suitable pointer and skips the
-    // per-frame heap allocation that was causing DMA heap exhaustion.
+    // Pre-allocated tx_dma_buf with DMA-aligned transfer length so
+    // setup_dma_priv_buffer() skips the per-frame heap allocation.
+    // rx_buffer stays NULL — no RX DMA setup occurs (MISO data discarded).
     assert(len <= ETH_MAX_PACKET_SIZE);
+    uint32_t spi_len = len;
     spi_transaction_t t = {
+        .flags     = 0,
         .cmd       = cmd,
         .addr      = addr,
-        .length    = 8 * len,
+        .length    = 8 * spi_len,
         .tx_buffer = ctx->tx_dma_buf,
     };
     esp_err_t ret = ESP_FAIL;

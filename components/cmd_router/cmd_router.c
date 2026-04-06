@@ -74,6 +74,9 @@ static void register_set_tx_power(void);
 #if defined(CONFIG_IDF_TARGET_ESP32C6)
 static void register_set_rf_switch(void);
 #endif
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+static void register_set_spi_clock(void);
+#endif
 static void register_acl(void);
 static void register_remote_console_cmd(void);
 static void register_syslog_cmd(void);
@@ -264,6 +267,7 @@ void register_router(void)
     register_set_ap_dns();
     register_set_eth_nat();
     register_set_eth_dhcps();
+    register_set_hostname();
     register_dhcp_reserve();
     register_portmap();
     register_acl();
@@ -276,9 +280,11 @@ void register_router(void)
     register_set_led_strip();
     register_set_ttl();
     register_set_tx_power();
-    register_set_hostname();
 #if defined(CONFIG_IDF_TARGET_ESP32C6)
     register_set_rf_switch();
+#endif
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+    register_set_spi_clock();
 #endif
     register_remote_console_cmd();
     register_syslog_cmd();
@@ -2068,6 +2074,51 @@ static void register_set_rf_switch(void)
 }
 #endif
 
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+#define _STRINGIFY(x) #x
+#define STRINGIFY(x)  _STRINGIFY(x)
+/* 'set_spi_clock' command — W5500 SPI clock speed (applied after restart) */
+static struct {
+    struct arg_int *mhz;
+    struct arg_end *end;
+} set_spi_clock_arg;
+
+static int set_spi_clock_cmd(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &set_spi_clock_arg);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_spi_clock_arg.end, argv[0]);
+        return 1;
+    }
+
+    int mhz = set_spi_clock_arg.mhz->ival[0];
+    if (mhz < 1 || mhz > 40) {
+        printf("SPI clock must be between 1 and 40 MHz.\n");
+        return 1;
+    }
+
+    esp_err_t err = set_config_param_int("spi_clk_mhz", mhz);
+    if (err == ESP_OK) {
+        printf("W5500 SPI clock set to %d MHz. Restart to apply\n", mhz);
+    }
+    return err;
+}
+
+static void register_set_spi_clock(void)
+{
+    set_spi_clock_arg.mhz = arg_int1(NULL, NULL, "<MHz>", "SPI clock speed in MHz (1-40, default: " STRINGIFY(CONFIG_ETH_SPI_CLOCK_MHZ) ")");
+    set_spi_clock_arg.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_spi_clock",
+        .help = "Set W5500 SPI clock speed in MHz (1-40). Saved to NVS, applied after restart.",
+        .hint = NULL,
+        .func = &set_spi_clock_cmd,
+        .argtable = &set_spi_clock_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+#endif // CONFIG_ETH_DOWNLINK_W5500
 
 /**
  * @brief Format IP address with device name for /32 addresses
