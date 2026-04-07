@@ -24,10 +24,12 @@ w5500_spi_stats_t w5500_spi_get_stats(void)
 {
     // Snapshot — counters are 32-bit and written atomically on RISC-V
     w5500_spi_stats_t snap = {
-        .read_spi_fail  = s_stats.read_spi_fail,
-        .read_timeout   = s_stats.read_timeout,
-        .write_spi_fail = s_stats.write_spi_fail,
-        .write_timeout  = s_stats.write_timeout,
+        .read_spi_fail   = s_stats.read_spi_fail,
+        .read_timeout    = s_stats.read_timeout,
+        .write_spi_fail  = s_stats.write_spi_fail,
+        .write_timeout   = s_stats.write_timeout,
+        .write_zero_copy = s_stats.write_zero_copy,
+        .write_bounce    = s_stats.write_bounce,
     };
     return snap;
 }
@@ -137,22 +139,42 @@ static IRAM_ATTR esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, u
                                                    const void *data, uint32_t len)
 {
     w5500_spi_ctx_t *ctx = spi_ctx;
-    // Pre-allocated tx_dma_buf with DMA-aligned transfer length so
-    // setup_dma_priv_buffer() skips the per-frame heap allocation.
-    // rx_buffer stays NULL — no RX DMA setup occurs (MISO data discarded).
     assert(len <= ETH_MAX_PACKET_SIZE);
-    uint32_t spi_len = len;
+
+    // Small register writes (≤4 bytes): inline in the transaction struct, no DMA.
+    // This mirrors the read path and avoids DMA setup for the frequent per-frame
+    // control register writes (TX_WR pointer, SEND command, SOCK_IR clear).
+    bool use_inline = (len <= 4);
+
+    // Large writes: use caller's buffer directly if it's DMA-capable and 4-byte
+    // aligned (zero-copy), otherwise bounce through tx_dma_buf.
+    // lwIP pbufs on ESP32-C3 are in internal SRAM (DMA-capable, MEM_ALIGNMENT=4)
+    // so this hits for nearly all forwarded frames.
+    // Unlike RX, TX has no length-rounding requirement on GDMA AHB.
+    bool direct_dma = !use_inline && esp_ptr_dma_capable(data) && (((uintptr_t)data) & 3) == 0;
+
     spi_transaction_t t = {
-        .flags     = 0,
+        .flags     = use_inline ? SPI_TRANS_USE_TXDATA : 0,
         .cmd       = cmd,
         .addr      = addr,
-        .length    = 8 * spi_len,
-        .tx_buffer = ctx->tx_dma_buf,
+        .length    = 8 * len,
+        .tx_buffer = (use_inline || direct_dma) ? NULL : ctx->tx_dma_buf,
     };
+    if (use_inline) {
+        memcpy(t.tx_data, data, len);   // copy before taking the lock
+    }
     esp_err_t ret = ESP_FAIL;
     if (xSemaphoreTake(ctx->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
-        // memcpy inside the mutex: tx_dma_buf is shared, must not race
-        memcpy(ctx->tx_dma_buf, data, len);
+        if (!use_inline) {
+            if (direct_dma) {
+                t.tx_buffer = data;     // point at caller's buffer inside the lock
+                s_stats.write_zero_copy++;
+            } else {
+                // tx_dma_buf is shared — copy inside the mutex to avoid races
+                memcpy(ctx->tx_dma_buf, data, len);
+                s_stats.write_bounce++;
+            }
+        }
         if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) {
             ret = ESP_OK;
         } else {
