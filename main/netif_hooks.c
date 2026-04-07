@@ -502,7 +502,13 @@ static IRAM_ATTR err_t dl_netif_input_hook(struct pbuf *p, struct netif *netif) 
                 if (IPH_V(iphdr) == 4) {
                     uint32_t dest = iphdr->dest.addr;
                     uint32_t ap_subnet = my_ap_ip & htonl(0xFFFFFF00);
-                    bool is_local = (dest & htonl(0xFFFFFF00)) == ap_subnet;
+                    // Local: same /24 subnet, limited broadcast (255.255.255.255),
+                    // or subnet broadcast (e.g. 192.168.4.255).
+                    // Broadcasts must not be blocked — they reach the router's own
+                    // services (DHCP, mDNS, etc.) and are never forwarded to the WAN.
+                    bool is_local = (dest & htonl(0xFFFFFF00)) == ap_subnet
+                                    || dest == 0xFFFFFFFFu                        /* 255.255.255.255 */
+                                    || dest == (ap_subnet | ~htonl(0xFFFFFF00));  /* subnet broadcast */
                     if (!is_local) {
                         if (vpn_route_all) {
                             // Block all non-local traffic
