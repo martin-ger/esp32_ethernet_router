@@ -33,4 +33,15 @@
 void w5500_spi_driver_config(eth_spi_custom_driver_config_t *driver,
                               const eth_w5500_config_t *w5500);
 
+/** SPI error counters — incremented from IRAM context, read from task context. */
+typedef struct {
+    uint32_t read_spi_fail;    /**< spi_device_polling_transmit errors on read */
+    uint32_t read_timeout;     /**< mutex timeout on read */
+    uint32_t write_spi_fail;   /**< spi_device_polling_transmit errors on write */
+    uint32_t write_timeout;    /**< mutex timeout on write */
+} w5500_spi_stats_t;
+
+/** Returns a snapshot of the current error counters. */
+w5500_spi_stats_t w5500_spi_get_stats(void);
+
 #endif // CONFIG_ETH_DOWNLINK_W5500

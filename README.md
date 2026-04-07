@@ -72,9 +72,9 @@ The WT32-ETH01 is an ESP32-based module with an integrated LAN8720 Ethernet PHY.
 
 ## Hardware — W5500 + ESP32-C3
 
-As an alternative to the WT32-ETH01, the router can run on an **ESP32-C3 SuperMini** (or any ESP32-C3 board) with an external **W5500 SPI Ethernet module**. There are no precompiled binaries for this setup as the boards and possible setups vary a lot - a single binary won't cover that.
+As a hardware alternative the router can run on an **ESP32-C3** with an external **W5500 SPI Ethernet module**. Be aware that this hardware is much less performant than the WT32-ETH01 (about 4 mbps downstream / 1 mbps upstream, recommended only for real IoT use cases). It uses SPI to send and receive ethernet frames, it has only one CPU core, lower clock rate, and less RAM. There are precompiled binaries for an **ESP32-C3 SuperMini** board with the SPI connections as given below. If your setup differs, adjust the config.
 
-**Caution:** The WiFi signal is often critical on the tiny SuperMini boards due to antenna issues. Typical symptoms can be, that you cannot connect to an AP correctly, even if you see it in a scan. Consider LOWERING the TX power with e.g. `set_tx_power 15`, as the signal gets distorted under max gain. If this doesn't help, search also the internet for possible DIY antenna fixes.
+**Caution:** The WiFi signal on an **ESP32-C3 SuperMini** board is often critical due to antenna issues. Typical symptoms can be, that you cannot connect to an AP correctly, even if you see it in a scan. Consider LOWERING the TX power with e.g. `set_tx_power 15`, as the signal gets distorted under max gain. If this doesn't help, search also the internet for possible DIY antenna fixes.
 
 | Parameter | Value |
 |-----------|-------|
@@ -85,7 +85,7 @@ As an alternative to the WT32-ETH01, the router can run on an **ESP32-C3 SuperMi
 
 ### Wiring
 
-All pin assignments are configurable via `idf.py menuconfig` → *Ethernet Downlink*.
+Pin assignments are configurable via `idf.py menuconfig` → *Ethernet Downlink*.
 
 The following setup is known to work:
 
@@ -126,7 +126,7 @@ idf.py -B build_w5500_c3 -p /dev/ttyUSB0 flash monitor   # DevKit-M-1 (UART)
 - The W5500 draws up to 250 mA, way to much for the SuperMini's internal 3.3V voltage regulator. Use an external power supply for the W5500.
 - The W5500 module has no factory MAC address. The firmware derives one automatically from the ESP32-C3's base MAC.
 - The onboard LED on the SuperMini (typically GPIO 8) can be configured via `set_led_gpio 8`.
-- SPI clock defaults to 25 MHz. Increase via `set_spi_clock` if wiring is short and clean; decrease if you see SPI errors.
+- SPI clock defaults to 25 MHz. Increase via `set_spi_clock` if wiring is short and clean; decrease if you see SPI errors (`show status` shows SPI error counters).
 
 ---
 

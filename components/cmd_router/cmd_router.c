@@ -38,6 +38,9 @@
 #include "driver/gpio.h"
 #include "router_globals.h"
 #include "cmd_router.h"
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+#include "w5500_spi_driver.h"
+#endif
 #include "pcap_capture.h"
 #include "acl.h"
 #include "remote_console.h"
@@ -1225,6 +1228,26 @@ static int show(int argc, char **argv)
 
         // Free heap
         printf("Free heap: %lu bytes\n", (unsigned long)esp_get_free_heap_size());
+
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+        // SPI clock speed (read from NVS, same logic as init)
+        int spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
+        get_config_param_int("spi_clk_mhz", &spi_mhz);
+        if (spi_mhz < 1 || spi_mhz > 40) spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
+        printf("SPI clock: %d MHz\n", spi_mhz);
+
+        // SPI error counters
+        w5500_spi_stats_t spi_stats = w5500_spi_get_stats();
+        if (spi_stats.read_spi_fail || spi_stats.read_timeout ||
+            spi_stats.write_spi_fail || spi_stats.write_timeout) {
+            printf("SPI errors: rd_fail=%"PRIu32" rd_timeout=%"PRIu32
+                   " wr_fail=%"PRIu32" wr_timeout=%"PRIu32"\n",
+                   spi_stats.read_spi_fail, spi_stats.read_timeout,
+                   spi_stats.write_spi_fail, spi_stats.write_timeout);
+        } else {
+            printf("SPI errors: none\n");
+        }
+#endif
 
         // Connected clients
         resync_connect_count();

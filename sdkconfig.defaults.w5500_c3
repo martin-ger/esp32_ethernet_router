@@ -68,3 +68,16 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # Additional WiFi library functions in IRAM (~5 KB); IRAM_OPT and RX_IRAM_OPT already default y
 #CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
 
+# --- RAM reduction for single-core C3 ---
+# WiFi dynamic buffers: default 48+48 is tuned for AP mode throughput.
+# As a STA-only uplink, 16+16 is sufficient and saves ~40 KB peak heap.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
+# TCP windows: default 5760 (4×MSS) wastes RAM on a NAT router where most
+# connections are short-lived or forwarded.  2×MSS (2880) is enough for
+# local throughput while cutting per-socket overhead in half.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
+

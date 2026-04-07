@@ -18,6 +18,20 @@
 
 static const char *TAG = "w5500.spi";
 
+static volatile w5500_spi_stats_t s_stats;
+
+w5500_spi_stats_t w5500_spi_get_stats(void)
+{
+    // Snapshot — counters are 32-bit and written atomically on RISC-V
+    w5500_spi_stats_t snap = {
+        .read_spi_fail  = s_stats.read_spi_fail,
+        .read_timeout   = s_stats.read_timeout,
+        .write_spi_fail = s_stats.write_spi_fail,
+        .write_timeout  = s_stats.write_timeout,
+    };
+    return snap;
+}
+
 #define W5500_SPI_LOCK_TIMEOUT_MS  50
 #define W5500_DMA_ALIGN            64   /* cache-line safe on all ESP32 variants */
 
@@ -80,8 +94,8 @@ static esp_err_t w5500_custom_spi_deinit(void *spi_ctx)
     return ESP_OK;
 }
 
-static esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr,
-                                        void *data, uint32_t len)
+static IRAM_ATTR esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr,
+                                                  void *data, uint32_t len)
 {
     w5500_spi_ctx_t *ctx = spi_ctx;
     // Small register reads (≤4 bytes): inline, no DMA.
@@ -108,16 +122,19 @@ static esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t add
             }
             // direct_dma: data already in caller's buffer, no copy needed
             ret = ESP_OK;
+        } else {
+            s_stats.read_spi_fail++;
         }
         xSemaphoreGive(ctx->lock);
     } else {
+        s_stats.read_timeout++;
         ret = ESP_ERR_TIMEOUT;
     }
     return ret;
 }
 
-static esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr,
-                                         const void *data, uint32_t len)
+static IRAM_ATTR esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr,
+                                                   const void *data, uint32_t len)
 {
     w5500_spi_ctx_t *ctx = spi_ctx;
     // Pre-allocated tx_dma_buf with DMA-aligned transfer length so
@@ -136,9 +153,14 @@ static esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t ad
     if (xSemaphoreTake(ctx->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
         // memcpy inside the mutex: tx_dma_buf is shared, must not race
         memcpy(ctx->tx_dma_buf, data, len);
-        if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) ret = ESP_OK;
+        if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) {
+            ret = ESP_OK;
+        } else {
+            s_stats.write_spi_fail++;
+        }
         xSemaphoreGive(ctx->lock);
     } else {
+        s_stats.write_timeout++;
         ret = ESP_ERR_TIMEOUT;
     }
     return ret;
