@@ -621,3 +621,4 @@ void init_downlink_netif_hooks(void) {
         }
     }
 }
+

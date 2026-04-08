@@ -40,7 +40,7 @@
 #define W5500_REG_SOCK_MR(s)         W5500_MAKE_MAP(0x0000, W5500_BSB_SOCK_REG(s)) // Socket Mode
 #define W5500_REG_SOCK_CR(s)         W5500_MAKE_MAP(0x0001, W5500_BSB_SOCK_REG(s)) // Socket Command
 #define W5500_REG_SOCK_IR(s)         W5500_MAKE_MAP(0x0002, W5500_BSB_SOCK_REG(s)) // Socket Interrupt
-#define W5500_REG_SOCK_SR(s)         W5500_MAKE_MAP(0x0004, W5500_BSB_SOCK_REG(s)) // Socket Status
+#define W5500_REG_SOCK_SR(s)         W5500_MAKE_MAP(0x0003, W5500_BSB_SOCK_REG(s)) // Socket Status
 #define W5500_REG_SOCK_RXBUF_SIZE(s) W5500_MAKE_MAP(0x001E, W5500_BSB_SOCK_REG(s)) // Socket Receive Buffer Size
 #define W5500_REG_SOCK_TXBUF_SIZE(s) W5500_MAKE_MAP(0x001F, W5500_BSB_SOCK_REG(s)) // Socket Transmit Buffer Size
 #define W5500_REG_SOCK_TX_FSR(s)     W5500_MAKE_MAP(0x0020, W5500_BSB_SOCK_REG(s)) // Socket TX Free Size
@@ -67,6 +67,8 @@
 #define W5500_SCR_CLOSE (0x10) // Close command
 #define W5500_SCR_SEND  (0x20) // Send command
 #define W5500_SCR_RECV  (0x40) // Recv command
+
+#define W5500_SSR_MACRAW (0x42) // Socket status: MACRAW open
 
 #define W5500_SIR_RECV (1<<2)  // Receive done
 #define W5500_SIR_SEND (1<<4)  // Send done

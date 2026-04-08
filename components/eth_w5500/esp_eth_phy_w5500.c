@@ -179,6 +179,9 @@ static esp_err_t w5500_reset_hw(esp_eth_phy_t *phy)
         gpio_output_enable(w5500->reset_gpio_num);
         esp_rom_delay_us(100); // insert min input assert time
         gpio_set_level(w5500->reset_gpio_num, 1);
+        // Enable internal pull-up so RST stays high against noise/transients
+        // (no external pull-up resistor on typical breakout boards)
+        gpio_pullup_en(w5500->reset_gpio_num);
     }
     return ESP_OK;
 }

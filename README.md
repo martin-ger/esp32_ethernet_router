@@ -503,6 +503,7 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 | `set_led_lowactive <true\|false>` | Invert LED polarity (active-low LEDs) |
 | `set_tx_power <dBm>` | Set WiFi transmit power |
 | `set_spi_clock <MHz>` | Set W5500 SPI clock speed in MHz (1-40, requires reboot) — W5500 only |
+| `w5500 <status\|reset>` | Shows W5500 chip status and can reset it |
 | `set_tz <TZ string>` | Set POSIX timezone |
 ---
 

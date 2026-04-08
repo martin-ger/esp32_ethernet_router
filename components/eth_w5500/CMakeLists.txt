@@ -3,7 +3,7 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "."          # for w5500.h (co-located with esp_eth_mac_w5500.c)
     REQUIRES esp_eth
-    PRIV_REQUIRES esp_driver_spi esp_driver_gpio esp_timer log heap freertos
+    PRIV_REQUIRES esp_driver_spi esp_driver_gpio esp_timer log heap freertos esp_system
 )
 
 # Remove the upstream W5500 MAC and PHY drivers from esp_eth and replace with

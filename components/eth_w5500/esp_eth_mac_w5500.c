@@ -25,6 +25,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "w5500.h"
+#include "w5500_spi_driver.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "w5500.mac";
@@ -71,6 +72,9 @@ typedef struct {
     uint8_t mcast_cnt;
     uint32_t tx_tmo;
 } emac_w5500_t;
+
+/* Single-instance pointer used by w5500_get_diag() */
+static emac_w5500_t *s_emac = NULL;
 
 static void *w5500_spi_init(const void *spi_config)
 {
@@ -332,6 +336,10 @@ static esp_err_t w5500_setup_default(emac_w5500_t *emac)
         ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_TXBUF_SIZE(i), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
     }
 
+    /* Restore MAC address — W5500_REG_MAC resets to 0 on hardware power-glitch.
+     * With MAC_FILTER enabled the chip silently drops all unicast frames that
+     * don't match this register, so it must be restored before opening SOCK0. */
+    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_MAC, emac->addr, ETH_ADDR_LEN), err, TAG, "write MAC address failed");
     /* Enable ping block, disable PPPoE, WOL */
     reg_value = W5500_MR_PB;
     ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_MR, &reg_value, sizeof(reg_value)), err, TAG, "write MR failed");
@@ -348,6 +356,31 @@ static esp_err_t w5500_setup_default(emac_w5500_t *emac)
     uint16_t int_level = __builtin_bswap16(0xFFFF);
     ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_INTLEVEL, &int_level, sizeof(int_level)), err, TAG, "write INTLEVEL failed");
 
+err:
+    return ret;
+}
+
+// Re-open SOCK0 in MAC-RAW mode and verify SOCK_SR reads back 0x42.
+// Returns ESP_OK on success, ESP_ERR_INVALID_STATE if the chip didn't respond
+// (e.g. still in hardware-reset recovery), ESP_FAIL on SPI error.
+static esp_err_t w5500_reopen_socket(emac_w5500_t *emac)
+{
+    esp_err_t ret = ESP_OK;
+    ESP_GOTO_ON_ERROR(w5500_send_command(emac, W5500_SCR_CLOSE, 100), err, TAG, "reopen: CLOSE failed");
+    ESP_GOTO_ON_ERROR(w5500_setup_default(emac), err, TAG, "reopen: setup_default failed");
+    ESP_GOTO_ON_ERROR(w5500_send_command(emac, W5500_SCR_OPEN, 100), err, TAG, "reopen: OPEN failed");
+    uint8_t simr = W5500_SIMR_SOCK0;
+    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SIMR, &simr, sizeof(simr)), err, TAG, "reopen: write SIMR failed");
+    // Verify the socket actually opened — if W5500 is still in hardware-reset
+    // the command register clears immediately (reads 0x00 by default) but the
+    // socket stays closed (SR=0x00 instead of 0x42=MACRAW).
+    uint8_t sr = 0;
+    ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_SOCK_SR(0), &sr, sizeof(sr)), err, TAG, "reopen: read SR failed");
+    if (sr != W5500_SSR_MACRAW) {
+        ESP_LOGW(TAG, "W5500 socket reopen failed (SR=0x%02X, expected 0x%02X) — chip may still be resetting",
+                 sr, W5500_SSR_MACRAW);
+        ret = ESP_ERR_INVALID_STATE;
+    }
 err:
     return ret;
 }
@@ -638,11 +671,9 @@ static esp_err_t emac_w5500_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t 
         // TX buffer is stuck (previous SEND never completed, e.g. due to a link glitch mid-TX).
         // Recover by closing and reopening SOCK0, which resets the TX/RX buffer pointers.
         ESP_LOGW(TAG, "TX stuck (free=%" PRIu16 " need=%" PRIu32 "), recovering socket", free_size, length);
-        w5500_send_command(emac, W5500_SCR_CLOSE, 100);
-        w5500_setup_default(emac);
-        w5500_send_command(emac, W5500_SCR_OPEN, 100);
-        uint8_t simr = W5500_SIMR_SOCK0;
-        w5500_write(emac, W5500_REG_SIMR, &simr, sizeof(simr));
+        if (w5500_reopen_socket(emac) != ESP_OK) {
+            return ESP_FAIL;  // chip not ready yet; drop frame, try again next time
+        }
         ESP_GOTO_ON_ERROR(w5500_get_tx_free_size(emac, &free_size), err, TAG, "get free size failed");
         ESP_GOTO_ON_FALSE(length <= free_size, ESP_ERR_NO_MEM, err, TAG,
                           "free size (%" PRIu16 ") < send length (%" PRIu32 ") after recovery", free_size, length);
@@ -665,8 +696,16 @@ static esp_err_t emac_w5500_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t 
     uint64_t now = 0;
     do {
         now = esp_timer_get_time();
-        if (!is_w5500_sane_for_rxtx(emac) || (now - start) > emac->tx_tmo) {
-            return ESP_FAIL;
+        if (!is_w5500_sane_for_rxtx(emac)) {
+            return ESP_FAIL;  // link down — wait for link-up event to re-init
+        }
+        if ((now - start) > emac->tx_tmo) {
+            // SIR_SEND never arrived: W5500 may have been power-reset (all registers
+            // back to defaults — socket closed, 2KB buffers, wrong mode).
+            // Re-initialise the socket so the next frame can be sent.
+            ESP_LOGW(TAG, "TX SEND timeout — re-initialising W5500 socket");
+            w5500_reopen_socket(emac);  // best-effort; SR readback logs if chip not ready
+            return ESP_FAIL;  // drop this frame; next frame will succeed
         }
         ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_SOCK_IR(0), &status, sizeof(status)), err, TAG, "read SOCK0 IR failed");
     } while (!(status & W5500_SIR_SEND));
@@ -835,6 +874,17 @@ static void emac_w5500_task(void *arg)
         } else {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         }
+        /* Detect W5500 hardware reset (power glitch): socket mode reverts to
+         * 0x00 (TCP default) and buffer sizes shrink to 2KB.  The link-down
+         * debounce may be too slow to catch a fast glitch, so check here and
+         * re-initialise proactively before the TX path tries to SEND on a
+         * closed socket. */
+        uint8_t sock_mr = 0;
+        if (w5500_read(emac, W5500_REG_SOCK_MR(0), &sock_mr, sizeof(sock_mr)) == ESP_OK
+                && sock_mr != (W5500_SMR_MAC_RAW | W5500_SMR_MAC_FILTER | W5500_SMR_MAC_BLOCK_MCAST)) {
+            ESP_LOGW(TAG, "W5500 register reset detected (SOCK_MR=0x%02X) — re-initialising", sock_mr);
+            w5500_reopen_socket(emac);  // SR readback logs if chip not fully ready yet
+        }
         /* read interrupt status */
         w5500_read(emac, W5500_REG_SOCK_IR(0), &status, sizeof(status));
         /* packet received */
@@ -928,6 +978,7 @@ static esp_err_t emac_w5500_deinit(esp_eth_mac_t *mac)
 static esp_err_t emac_w5500_del(esp_eth_mac_t *mac)
 {
     emac_w5500_t *emac = __containerof(mac, emac_w5500_t, parent);
+    if (emac == s_emac) s_emac = NULL;
     if (emac->poll_timer) {
         esp_timer_delete(emac->poll_timer);
     }
@@ -936,6 +987,43 @@ static esp_err_t emac_w5500_del(esp_eth_mac_t *mac)
     heap_caps_free(emac->rx_buffer);
     free(emac);
     return ESP_OK;
+}
+
+esp_err_t w5500_get_diag(w5500_diag_t *out)
+{
+    if (!s_emac || !out) return ESP_ERR_INVALID_STATE;
+    memset(out, 0, sizeof(*out));
+
+    uint16_t tmp16;
+
+    /* Common registers */
+    w5500_read(s_emac, W5500_REG_VERSIONR,  &out->version,  1);
+    w5500_read(s_emac, W5500_REG_PHYCFGR,   &out->phycfgr,  1);
+    w5500_read(s_emac, W5500_REG_SIMR,      &out->simr,     1);
+
+    /* Socket 0 control/status */
+    w5500_read(s_emac, W5500_REG_SOCK_MR(0),  &out->sock_mr,  1);
+    w5500_read(s_emac, W5500_REG_SOCK_SR(0),  &out->sock_sr,  1);
+    w5500_read(s_emac, W5500_REG_SOCK_IR(0),  &out->sock_ir,  1);
+    w5500_read(s_emac, W5500_REG_SOCK_IMR(0), &out->sock_imr, 1);
+
+    /* TX buffer pointers (16-bit, big-endian on wire) */
+    w5500_read(s_emac, W5500_REG_SOCK_TX_FSR(0), &tmp16, 2); out->tx_fsr = __builtin_bswap16(tmp16);
+    w5500_read(s_emac, W5500_REG_SOCK_TX_RD(0),  &tmp16, 2); out->tx_rd  = __builtin_bswap16(tmp16);
+    w5500_read(s_emac, W5500_REG_SOCK_TX_WR(0),  &tmp16, 2); out->tx_wr  = __builtin_bswap16(tmp16);
+
+    /* RX buffer pointers */
+    w5500_read(s_emac, W5500_REG_SOCK_RX_RSR(0), &tmp16, 2); out->rx_rsr = __builtin_bswap16(tmp16);
+    w5500_read(s_emac, W5500_REG_SOCK_RX_RD(0),  &tmp16, 2); out->rx_rd  = __builtin_bswap16(tmp16);
+    w5500_read(s_emac, W5500_REG_SOCK_RX_WR(0),  &tmp16, 2); out->rx_wr  = __builtin_bswap16(tmp16);
+
+    return ESP_OK;
+}
+
+esp_err_t w5500_reset_socket(void)
+{
+    if (!s_emac) return ESP_ERR_INVALID_STATE;
+    return w5500_reopen_socket(s_emac);
 }
 
 esp_eth_mac_t *esp_eth_mac_new_w5500(const eth_w5500_config_t *w5500_config, const eth_mac_config_t *mac_config)
@@ -1013,6 +1101,7 @@ esp_eth_mac_t *esp_eth_mac_new_w5500(const eth_w5500_config_t *w5500_config, con
         ESP_GOTO_ON_FALSE(esp_timer_create(&poll_timer_args, &emac->poll_timer) == ESP_OK, NULL, err, TAG, "create poll timer failed");
     }
 
+    s_emac = emac;
     return &(emac->parent);
 
 err:
