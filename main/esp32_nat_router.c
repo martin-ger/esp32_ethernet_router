@@ -488,6 +488,7 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
 #endif  // CONFIG_ETH_DOWNLINK_W5500
 
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(eth_mac, phy);
+    config.check_link_period_ms = 1000;  // poll every 1s; debounce=4 → 4s to confirm link-down
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
 
 #if defined(CONFIG_ETH_DOWNLINK_W5500)

@@ -24,12 +24,10 @@ w5500_spi_stats_t w5500_spi_get_stats(void)
 {
     // Snapshot — counters are 32-bit and written atomically on RISC-V
     w5500_spi_stats_t snap = {
-        .read_spi_fail   = s_stats.read_spi_fail,
-        .read_timeout    = s_stats.read_timeout,
-        .write_spi_fail  = s_stats.write_spi_fail,
-        .write_timeout   = s_stats.write_timeout,
-        .write_zero_copy = s_stats.write_zero_copy,
-        .write_bounce    = s_stats.write_bounce,
+        .read_spi_fail  = s_stats.read_spi_fail,
+        .read_timeout   = s_stats.read_timeout,
+        .write_spi_fail = s_stats.write_spi_fail,
+        .write_timeout  = s_stats.write_timeout,
     };
     return snap;
 }
@@ -168,11 +166,9 @@ static IRAM_ATTR esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, u
         if (!use_inline) {
             if (direct_dma) {
                 t.tx_buffer = data;     // point at caller's buffer inside the lock
-                s_stats.write_zero_copy++;
             } else {
                 // tx_dma_buf is shared — copy inside the mutex to avoid races
                 memcpy(ctx->tx_dma_buf, data, len);
-                s_stats.write_bounce++;
             }
         }
         if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) {

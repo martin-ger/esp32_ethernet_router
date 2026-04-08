@@ -39,8 +39,6 @@ typedef struct {
     uint32_t read_timeout;      /**< mutex timeout on read */
     uint32_t write_spi_fail;    /**< spi_device_polling_transmit errors on write */
     uint32_t write_timeout;     /**< mutex timeout on write */
-    uint32_t write_zero_copy;   /**< TX frames sent without bounce-buffer copy */
-    uint32_t write_bounce;      /**< TX frames that required a copy into tx_dma_buf */
 } w5500_spi_stats_t;
 
 /** Returns a snapshot of the current error counters. */

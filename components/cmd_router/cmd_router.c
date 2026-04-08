@@ -1236,7 +1236,7 @@ static int show(int argc, char **argv)
         if (spi_mhz < 1 || spi_mhz > 40) spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
         printf("SPI clock: %d MHz\n", spi_mhz);
 
-        // SPI error counters and TX zero-copy stats
+        // SPI error counters
         w5500_spi_stats_t spi_stats = w5500_spi_get_stats();
         if (spi_stats.read_spi_fail || spi_stats.read_timeout ||
             spi_stats.write_spi_fail || spi_stats.write_timeout) {
@@ -1247,8 +1247,6 @@ static int show(int argc, char **argv)
         } else {
             printf("SPI errors: none\n");
         }
-        printf("SPI TX: zero_copy=%"PRIu32" bounce=%"PRIu32"\n",
-               spi_stats.write_zero_copy, spi_stats.write_bounce);
 #endif
 
         // Connected clients
