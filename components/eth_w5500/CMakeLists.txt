@@ -7,7 +7,7 @@ idf_component_register(
 )
 
 # Remove the upstream W5500 MAC and PHY drivers from esp_eth and replace with
-# our patched versions (taskYIELD in TX-done loop, link-down debounce in PHY).
+# our patched versions (DMA for SPI without dynamic allocation, link-down debounce in PHY, re-init after errors).
 idf_component_get_property(esp_eth_lib esp_eth COMPONENT_LIB)
 get_target_property(esp_eth_sources ${esp_eth_lib} SOURCES)
 list(FILTER esp_eth_sources EXCLUDE REGEX "esp_eth_mac_w5500\\.c$")
