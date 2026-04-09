@@ -69,6 +69,59 @@ static const char *get_client_ip(httpd_req_t *req, char *buf, size_t buf_len)
     return buf;
 }
 
+/* Web UI interface access bitmask (RC_BIND_AP=ETH, RC_BIND_STA, RC_BIND_VPN).
+ * Loaded from NVS in start_webserver(). Default: all interfaces allowed. */
+static uint8_t s_web_bind = RC_BIND_AP | RC_BIND_STA | RC_BIND_VPN;
+
+/* Check whether an incoming HTTP connection is allowed based on which
+ * network interface it arrived on.  Called by esp_http_server before any
+ * data is exchanged; returning ESP_FAIL closes the socket immediately.
+ *
+ * getsockname() on the accepted socket returns the local IP that was used
+ * by the client — i.e. the address of the interface the packet arrived on.
+ * esp_http_server uses IPv6 sockets, so IPv4 connections appear as
+ * ::ffff:x.x.x.x (IPv4-mapped).  The same extraction used in get_client_ip()
+ * is applied here for the local side.
+ *
+ * The allow/deny decision is left as a placeholder (always allowed for now).
+ */
+static esp_err_t http_open_fn(httpd_handle_t hd, int sockfd)
+{
+    struct sockaddr_in6 local_addr6;
+    socklen_t addr_len = sizeof(local_addr6);
+    uint32_t local_ip = 0;  /* network byte order */
+
+    if (getsockname(sockfd, (struct sockaddr *)&local_addr6, &addr_len) == 0) {
+        if (local_addr6.sin6_family == AF_INET6) {
+            /* IPv4-mapped IPv6: last 4 bytes of s6_addr are the IPv4 address */
+            memcpy(&local_ip, local_addr6.sin6_addr.s6_addr + 12, 4);
+        } else {
+            local_ip = ((struct sockaddr_in *)&local_addr6)->sin_addr.s_addr;
+        }
+    }
+
+    /* Identify which interface the connection arrived on */
+    bool on_eth = (local_ip != 0 && local_ip == my_ap_ip);
+    bool on_sta = (local_ip != 0 && local_ip == my_ip);
+    bool on_vpn = (local_ip != 0 && vpn_connected && vpn_tunnel_ip != 0 && local_ip == vpn_tunnel_ip);
+
+    /* Enforce interface access policy */
+    bool allowed = false;
+    if (on_eth && (s_web_bind & RC_BIND_AP))  allowed = true;
+    if (on_sta && (s_web_bind & RC_BIND_STA)) allowed = true;
+    if (on_vpn && (s_web_bind & RC_BIND_VPN)) allowed = true;
+    /* If local_ip could not be determined, allow through (fail open) */
+    if (local_ip == 0) allowed = true;
+
+    if (!allowed) {
+        ESP_LOGW(TAG, "HTTP connection rejected (interface not allowed, local=" IPSTR ")",
+                 IP2STR((ip4_addr_t *)&local_ip));
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
 static void web_server_start_captive_dns(void);
 
 esp_timer_handle_t restart_timer;
@@ -977,6 +1030,23 @@ static httpd_uri_t indexp = {
     .handler   = index_get_handler,
 };
 
+uint8_t web_ui_get_bind(void)
+{
+    return s_web_bind;
+}
+
+void web_ui_set_bind(uint8_t bind)
+{
+    if (bind == 0) bind = RC_BIND_AP;  /* must keep at least one */
+    s_web_bind = bind & (RC_BIND_AP | RC_BIND_STA | RC_BIND_VPN);
+    set_config_param_int("web_bind", (int32_t)s_web_bind);
+    char buf[20] = "";
+    if (s_web_bind & RC_BIND_AP)  strcat(buf, "ETH ");
+    if (s_web_bind & RC_BIND_STA) strcat(buf, "STA ");
+    if (s_web_bind & RC_BIND_VPN) strcat(buf, "VPN ");
+    ESP_LOGI(TAG, "Web UI bind set to: %s", buf);
+}
+
 /* Router Config page GET handler */
 static esp_err_t config_get_handler(httpd_req_t *req)
 {
@@ -1248,6 +1318,22 @@ static esp_err_t config_get_handler(httpd_req_t *req)
                 return ESP_OK;
             }
 
+            /* Handle Web UI bind interface settings */
+            if (httpd_query_key_value(buf, "web_bind_save", param1, sizeof(param1)) == ESP_OK) {
+                uint8_t bind = 0;
+                if (httpd_query_key_value(buf, "web_bind_eth", param1, sizeof(param1)) == ESP_OK) bind |= RC_BIND_AP;
+                if (httpd_query_key_value(buf, "web_bind_sta", param1, sizeof(param1)) == ESP_OK) bind |= RC_BIND_STA;
+                if (httpd_query_key_value(buf, "web_bind_vpn", param1, sizeof(param1)) == ESP_OK) bind |= RC_BIND_VPN;
+                if (bind == 0) bind = RC_BIND_AP;
+                web_ui_set_bind(bind);
+                ESP_LOGI(TAG, "Web UI bind interfaces updated via web");
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/config");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
+
             /* Handle PCAP settings (single form) */
             if (httpd_query_key_value(buf, "pcap_save", param1, sizeof(param1)) == ESP_OK) {
                 if (httpd_query_key_value(buf, "pcap_mode", param1, sizeof(param1)) == ESP_OK) {
@@ -1470,8 +1556,19 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
     }
 
-    /* Chunk 9b: OTA upload form, config backup/restore, and footer */
+    /* Chunk 9b: OTA upload form, config backup/restore, reboot */
     httpd_resp_send_chunk(req, CONFIG_CHUNK_TAIL2, HTTPD_RESP_USE_STRLEN);
+
+    /* Chunk 9c: Danger Zone (web bind + disable interface).
+     * Uses its own buffer — CONFIG_CHUNK_DANGER exceeds the shared section[2048]. */
+    {
+        char danger[2560];
+        snprintf(danger, sizeof(danger), CONFIG_CHUNK_DANGER,
+            (s_web_bind & RC_BIND_AP)  ? "checked" : "",
+            (s_web_bind & RC_BIND_STA) ? "checked" : "",
+            (s_web_bind & RC_BIND_VPN) ? "checked" : "");
+        httpd_resp_send_chunk(req, danger, HTTPD_RESP_USE_STRLEN);
+    }
 
     /* End chunked response */
     httpd_resp_send_chunk(req, NULL, 0);
@@ -2706,6 +2803,15 @@ httpd_handle_t start_webserver(uint16_t port)
     config.stack_size = 16384;  // Large stack needed for mappings page with 3x 2KB HTML buffers
     config.max_uri_handlers = 13;
     config.max_uri_len = 1024;
+    config.open_fn = http_open_fn;
+
+    /* Load web UI interface bind mask from NVS */
+    {
+        int bind_val = (int)(RC_BIND_AP | RC_BIND_STA | RC_BIND_VPN);
+        get_config_param_int("web_bind", &bind_val);
+        s_web_bind = (uint8_t)(bind_val & (RC_BIND_AP | RC_BIND_STA | RC_BIND_VPN));
+        if (s_web_bind == 0) s_web_bind = RC_BIND_AP;
+    }
 
     esp_timer_create(&restart_timer_args, &restart_timer);
 

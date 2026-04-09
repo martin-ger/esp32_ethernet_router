@@ -44,6 +44,9 @@
 #include "pcap_capture.h"
 #include "acl.h"
 #include "remote_console.h"
+/* web UI bind API — avoids pulling in esp_http_server.h */
+extern uint8_t web_ui_get_bind(void);
+extern void    web_ui_set_bind(uint8_t bind);
 #include "syslog_client.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
@@ -829,9 +832,20 @@ static void register_set_hostname(void)
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
 
+/* Format web UI bind mask as a string, e.g. "ETH STA " */
+static void fmt_web_bind(uint8_t bind, char *buf)
+{
+    buf[0] = '\0';
+    if (bind & RC_BIND_AP)  strcat(buf, "ETH ");
+    if (bind & RC_BIND_STA) strcat(buf, "STA ");
+    if (bind & RC_BIND_VPN) strcat(buf, "VPN ");
+    if (buf[0] == '\0') strcpy(buf, "(none)");
+}
+
 /* 'web_ui' command */
 static int web_ui_cmd(int argc, char **argv)
 {
+
     if (argc < 2) {
         /* Show current status */
         char* lock = NULL;
@@ -839,17 +853,20 @@ static int web_ui_cmd(int argc, char **argv)
         bool enabled = (lock == NULL || strcmp(lock, "0") == 0);
         int port = 80;
         get_config_param_int("web_port", &port);
-        printf("Web interface: %s (port %d)\n", enabled ? "enabled" : "disabled", port);
+        char bind_str[20];
+        fmt_web_bind(web_ui_get_bind(), bind_str);
+        printf("Web interface: %s (port %d, bind: %s)\n", enabled ? "enabled" : "disabled", port, bind_str);
         printf("\nUsage:\n");
-        printf("  web_ui enable           - Enable web interface (after reboot)\n");
-        printf("  web_ui disable          - Disable web interface (after reboot)\n");
-        printf("  web_ui port <port>      - Set web server port (after reboot)\n");
+        printf("  web_ui enable                     - Enable web interface (after reboot)\n");
+        printf("  web_ui disable                    - Disable web interface (after reboot)\n");
+        printf("  web_ui port <port>                - Set web server port (after reboot)\n");
+        printf("  web_ui bind <eth|sta|vpn|all>     - Set allowed interfaces (takes effect immediately)\n");
         if (lock != NULL) free(lock);
         return 0;
     }
 
     const char *action = argv[1];
-    esp_err_t err;
+    esp_err_t err = ESP_OK;
 
     if (strcmp(action, "enable") == 0) {
         err = set_config_param_str("web_disabled", "0");
@@ -882,9 +899,45 @@ static int web_ui_cmd(int argc, char **argv)
             ESP_LOGI(TAG, "Web server port set to %d.", port);
             printf("Web server port set to %d (after reboot).\n", port);
         }
+    } else if (strcmp(action, "bind") == 0) {
+        if (argc < 3) {
+            char bind_str[20];
+            fmt_web_bind(web_ui_get_bind(), bind_str);
+            printf("Current web UI bind: %s\n", bind_str);
+            printf("Usage: web_ui bind <eth|sta|vpn|all>\n");
+            printf("  Interfaces may be comma-separated: web_ui bind eth,sta\n");
+            return 0;
+        }
+        /* Parse comma-separated interface list or "all" */
+        uint8_t bind = 0;
+        char arg[64];
+        strlcpy(arg, argv[2], sizeof(arg));
+        if (strcmp(arg, "all") == 0) {
+            bind = RC_BIND_AP | RC_BIND_STA | RC_BIND_VPN;
+        } else {
+            char *tok = strtok(arg, ",");
+            while (tok) {
+                if      (strcmp(tok, "eth") == 0) bind |= RC_BIND_AP;
+                else if (strcmp(tok, "sta") == 0) bind |= RC_BIND_STA;
+                else if (strcmp(tok, "vpn") == 0) bind |= RC_BIND_VPN;
+                else {
+                    printf("Unknown interface '%s' (valid: eth, sta, vpn, all)\n", tok);
+                    return 1;
+                }
+                tok = strtok(NULL, ",");
+            }
+        }
+        if (bind == 0) {
+            printf("At least one interface required, defaulting to eth.\n");
+            bind = RC_BIND_AP;
+        }
+        web_ui_set_bind(bind);
+        char bind_str[20];
+        fmt_web_bind(bind, bind_str);
+        printf("Web UI access restricted to: %s(takes effect immediately)\n", bind_str);
     } else {
         printf("Unknown action: %s\n", action);
-        printf("Usage: web_ui <enable|disable|port>\n");
+        printf("Usage: web_ui <enable|disable|port|bind>\n");
         return 1;
     }
 
@@ -896,11 +949,12 @@ static void register_web_ui(void)
     const esp_console_cmd_t cmd = {
         .command = "web_ui",
         .help = "Manage the web interface\n"
-                "  web_ui              - Show current status\n"
-                "  web_ui enable       - Enable web interface (after reboot)\n"
-                "  web_ui disable      - Disable web interface (after reboot)\n"
-                "  web_ui port <port>  - Set web server port (after reboot)",
-        .hint = " <enable|disable|port>",
+                "  web_ui                        - Show current status\n"
+                "  web_ui enable                 - Enable web interface (after reboot)\n"
+                "  web_ui disable                - Disable web interface (after reboot)\n"
+                "  web_ui port <port>            - Set web server port (after reboot)\n"
+                "  web_ui bind <eth|sta|vpn|all> - Set allowed interfaces (immediate)",
+        .hint = " <enable|disable|port|bind>",
         .func = &web_ui_cmd,
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
@@ -1349,8 +1403,16 @@ static int show(int argc, char **argv)
         bool web_enabled = (web_lock == NULL || strcmp(web_lock, "0") == 0);
         int web_port = 80;
         get_config_param_int("web_port", &web_port);
-        printf("\nWeb Interface: %s (port %d)\n", web_enabled ? "enabled" : "disabled", web_port);
+        char web_bind_buf[20];
+        fmt_web_bind(web_ui_get_bind(), web_bind_buf);
+        printf("\nWeb Interface: %s (port %d, bind: %s)\n", web_enabled ? "enabled" : "disabled", web_port, web_bind_buf);
         if (web_lock != NULL) free(web_lock);
+
+        remote_console_config_t rc_cfg;
+        remote_console_get_config(&rc_cfg);
+        char rc_bind_buf[20];
+        fmt_web_bind(rc_cfg.bind, rc_bind_buf);
+        printf("Remote Console: %s (port %d, bind: %s)\n", rc_cfg.enabled ? "enabled" : "disabled", rc_cfg.port, rc_bind_buf);
 
         int8_t tx_power = 0;
         if (esp_wifi_get_max_tx_power(&tx_power) == ESP_OK) {
@@ -2633,10 +2695,7 @@ static int remote_console_cmd(int argc, char **argv)
         printf("Enabled:        %s\n", config.enabled ? "yes" : "no");
         printf("Port:           %d\n", config.port);
 
-        printf("Interface:      %s%s%s\n",
-               (config.bind & RC_BIND_AP) ? "ETH " : "",
-               (config.bind & RC_BIND_STA) ? "STA " : "",
-               (config.bind & RC_BIND_VPN) ? "VPN " : "");
+        { char _bs[20]; fmt_web_bind(config.bind, _bs); printf("Interface:      %s\n", _bs); }
         printf("Idle timeout:   %lu sec\n", (unsigned long)config.idle_timeout_sec);
 
         const char *state_str[] = {"disabled", "listening", "auth wait", "active"};
