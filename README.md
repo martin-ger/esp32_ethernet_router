@@ -87,7 +87,7 @@ As a hardware alternative the router can run on an **ESP32-C3** with an external
 
 Pin assignments are configurable via `idf.py menuconfig` → *Ethernet Downlink*.
 
-The following setup is known to work:
+The following setup is known to work and uses the C3's native SPI pins:
 
 | W5500 Pin | ESP32-C3 GPIO | Function |
 |-----------|---------------|----------|
