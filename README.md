@@ -152,6 +152,7 @@ Grouped into sections. Changes trigger a reboot to apply.
 - *Remote Console* — enable/disable, port, interface binding (ETH/STA/VPN), idle timeout
 - *PCAP Packet Capture* — capture mode (off / ACL monitor / promiscuous), snaplen, live stats
 - *Device Management* — OTA firmware upload, factory reset
+- *Web UI Settings* — Access to the web UI
 
 **Mappings**
 
