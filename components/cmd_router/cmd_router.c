@@ -1278,6 +1278,12 @@ static int show(int argc, char **argv)
         } else {
             printf("Uplink IP: none\n");
         }
+        {
+            ip4_addr_t addr;
+            addr.addr = my_ap_ip;
+            printf("Ethernet IP: " IPSTR "\n", IP2STR(&addr));
+        }
+        printf("Ethernet: %s\n", eth_link_up ? "link up" : "link down");
 
         // Byte counts
         printf("Bytes sent/received: %" PRIu64 " / %" PRIu64 " bytes\n", get_sta_bytes_sent(), get_sta_bytes_received());

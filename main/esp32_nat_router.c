@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <inttypes.h>
 #include <time.h>
 #include <pthread.h>
@@ -112,7 +113,6 @@ static EventGroupHandle_t wifi_event_group;
  * - are we connected to the AP with an IP? */
 const int WIFI_CONNECTED_BIT = BIT0;
 
-#define DEFAULT_AP_IP "192.168.4.1"
 #define DEFAULT_DNS "8.8.8.8"
 
 
@@ -133,6 +133,7 @@ struct dhcp_reservation_entry dhcp_reservations[MAX_DHCP_RESERVATIONS];
 
 uint8_t eth_nat_enabled = 1;  // NAT enabled by default
 uint8_t eth_dhcps_enabled = 1;  // DHCP server enabled by default
+bool eth_link_up = false;  // Ethernet link state
 
 esp_netif_t* wifiSTA;
 esp_netif_t* ethNetif = NULL;
@@ -388,10 +389,12 @@ static void eth_downlink_event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == ETH_EVENT) {
         if (event_id == ETHERNET_EVENT_CONNECTED) {
             ESP_LOGI(TAG, "Ethernet downlink: link up");
+            eth_link_up = true;
             // Install downlink netif hooks once Ethernet link is active
             init_downlink_netif_hooks();
         } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
             ESP_LOGI(TAG, "Ethernet downlink: link down");
+            eth_link_up = false;
         } else if (event_id == ETHERNET_EVENT_START) {
             ESP_LOGI(TAG, "Ethernet downlink: started");
         }

@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,9 @@ extern uint8_t eth_nat_enabled;
 
 // Ethernet DHCP server (1 = enabled (default), 0 = disabled)
 extern uint8_t eth_dhcps_enabled;
+
+// Ethernet link state (true = link up, false = link down)
+extern bool eth_link_up;
 
 // Byte counting functions
 void init_byte_counter(void);
