@@ -1295,7 +1295,7 @@ static int show(int argc, char **argv)
         // SPI clock speed (read from NVS, same logic as init)
         int spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
         get_config_param_int("spi_clk_mhz", &spi_mhz);
-        if (spi_mhz < 1 || spi_mhz > 40) spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
+        if (spi_mhz < 1 || spi_mhz > 80) spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
         printf("SPI clock: %d MHz\n", spi_mhz);
 
         // SPI error counters
@@ -2185,8 +2185,8 @@ static int set_spi_clock_cmd(int argc, char **argv)
     }
 
     int mhz = set_spi_clock_arg.mhz->ival[0];
-    if (mhz < 1 || mhz > 40) {
-        printf("SPI clock must be between 1 and 40 MHz.\n");
+    if (mhz < 1 || mhz > 80) {
+        printf("SPI clock must be between 1 and 80 MHz.\n");
         return 1;
     }
 
@@ -2199,12 +2199,12 @@ static int set_spi_clock_cmd(int argc, char **argv)
 
 static void register_set_spi_clock(void)
 {
-    set_spi_clock_arg.mhz = arg_int1(NULL, NULL, "<MHz>", "SPI clock speed in MHz (1-40, default: " STRINGIFY(CONFIG_ETH_SPI_CLOCK_MHZ) ")");
+    set_spi_clock_arg.mhz = arg_int1(NULL, NULL, "<MHz>", "SPI clock speed in MHz (1-80, default: " STRINGIFY(CONFIG_ETH_SPI_CLOCK_MHZ) ")");
     set_spi_clock_arg.end = arg_end(1);
 
     const esp_console_cmd_t cmd = {
         .command = "set_spi_clock",
-        .help = "Set W5500 SPI clock speed in MHz (1-40). Saved to NVS, applied after restart.",
+        .help = "Set W5500 SPI clock speed in MHz (1-80). Saved to NVS, applied after restart.",
         .hint = NULL,
         .func = &set_spi_clock_cmd,
         .argtable = &set_spi_clock_arg

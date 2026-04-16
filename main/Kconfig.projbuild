@@ -83,7 +83,7 @@ menu "Ethernet Downlink"
     config ETH_SPI_CLOCK_MHZ
         int "W5500 SPI clock speed (MHz)"
         default 10
-        range 1 40
+        range 1 80
         depends on ETH_DOWNLINK_W5500
 
 endmenu

@@ -202,6 +202,92 @@ static void register_heap(void)
 /** 'tasks' command prints the list of tasks and related information */
 #if WITH_TASKS_INFO
 
+#ifdef CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+#define TASKS_SAMPLE_PERIOD_MS 1000
+
+static const char *task_state_str(eTaskState s)
+{
+    switch (s) {
+        case eRunning:   return "RUN";
+        case eReady:     return "RDY";
+        case eBlocked:   return "BLK";
+        case eSuspended: return "SUS";
+        case eDeleted:   return "DEL";
+        default:         return "?";
+    }
+}
+
+static int tasks_info(int argc, char **argv)
+{
+    UBaseType_t array_size = uxTaskGetNumberOfTasks() + 4;
+    TaskStatus_t *start = calloc(array_size, sizeof(TaskStatus_t));
+    TaskStatus_t *end   = calloc(array_size, sizeof(TaskStatus_t));
+    if (!start || !end) {
+        free(start); free(end);
+        ESP_LOGE(TAG, "failed to allocate task snapshot buffers");
+        return 1;
+    }
+
+    uint32_t start_total = 0, end_total = 0;
+    UBaseType_t start_n = uxTaskGetSystemState(start, array_size, &start_total);
+    vTaskDelay(pdMS_TO_TICKS(TASKS_SAMPLE_PERIOD_MS));
+    UBaseType_t end_n = uxTaskGetSystemState(end, array_size, &end_total);
+
+    uint32_t elapsed = end_total - start_total;
+    if (start_n == 0 || end_n == 0 || elapsed == 0) {
+        printf("Run-time stats unavailable\n");
+        free(start); free(end);
+        return 1;
+    }
+
+    printf("Task             Prio St  HWM    CPU%%");
+#ifdef CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
+    printf("   Core");
+#endif
+    printf("\n");
+
+    for (UBaseType_t i = 0; i < start_n; i++) {
+        UBaseType_t j;
+        for (j = 0; j < end_n; j++) {
+            if (start[i].xHandle == end[j].xHandle) break;
+        }
+        if (j == end_n) continue;
+
+        uint32_t delta = end[j].ulRunTimeCounter - start[i].ulRunTimeCounter;
+        uint32_t pct_x100 = (uint32_t)(((uint64_t)delta * 10000) / elapsed);
+
+        printf("%-16s %3u  %-3s %5u  %3u.%02u",
+               end[j].pcTaskName,
+               (unsigned)end[j].uxCurrentPriority,
+               task_state_str(end[j].eCurrentState),
+               (unsigned)end[j].usStackHighWaterMark,
+               (unsigned)(pct_x100 / 100),
+               (unsigned)(pct_x100 % 100));
+#ifdef CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
+        BaseType_t core = end[j].xCoreID;
+        if (core == tskNO_AFFINITY) printf("    -");
+        else                        printf("    %d", (int)core);
+#endif
+        printf("\n");
+    }
+
+    for (UBaseType_t j = 0; j < end_n; j++) {
+        UBaseType_t i;
+        for (i = 0; i < start_n; i++) {
+            if (start[i].xHandle == end[j].xHandle) break;
+        }
+        if (i == start_n) {
+            printf("%-16s %3u  NEW %5u      -\n",
+                   end[j].pcTaskName,
+                   (unsigned)end[j].uxCurrentPriority,
+                   (unsigned)end[j].usStackHighWaterMark);
+        }
+    }
+
+    free(start); free(end);
+    return 0;
+}
+#else /* !CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS */
 static int tasks_info(int argc, char **argv)
 {
     const size_t bytes_per_task = 40; /* see vTaskList description */
@@ -220,12 +306,13 @@ static int tasks_info(int argc, char **argv)
     free(task_list_buffer);
     return 0;
 }
+#endif
 
 static void register_tasks(void)
 {
     const esp_console_cmd_t cmd = {
         .command = "tasks",
-        .help = "Get information about running tasks",
+        .help = "Get information about running tasks (samples CPU % over 1 s)",
         .hint = NULL,
         .func = &tasks_info,
     };

@@ -443,7 +443,7 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     // Read SPI clock from NVS (set_spi_clock command), fall back to Kconfig default
     int spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
     get_config_param_int("spi_clk_mhz", &spi_mhz);
-    if (spi_mhz < 1 || spi_mhz > 40) spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
+    if (spi_mhz < 1 || spi_mhz > 80) spi_mhz = CONFIG_ETH_SPI_CLOCK_MHZ;
     devcfg.clock_speed_hz = spi_mhz * 1000 * 1000;
 
     ESP_LOGI(TAG, "Initializing SPI driver with %d MHz.", spi_mhz);
@@ -455,10 +455,10 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     w5500_spi_driver_config(&w5500_config.custom_spi_driver, &w5500_config);
 
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
-    // Raise RX task priority to match lwIP (default is 15, lwIP is 18).
-    // On single-core C3 the RX task does 4+ SPI reads per frame; running below
-    // lwIP and WiFi meant it was frequently preempted mid-read, throttling ETH→WiFi.
-    mac_config.rx_task_prio = 18;
+    // Run one step above lwIP (18) so the W5500 INT wakeup immediately preempts
+    // tcpip_thread — critical for draining the 16 KB RX FIFO before overflow and
+    // for starting the next TX frame without queuing behind lwIP processing.
+    mac_config.rx_task_prio = 19;
     esp_eth_mac_t *eth_mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
 
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();

@@ -19,11 +19,13 @@
 #include "esp_system.h"
 #include "esp_intr_alloc.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "esp_cpu.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "w5500.h"
 #include "w5500_spi_driver.h"
 #include "sdkconfig.h"
@@ -35,7 +37,16 @@ static const char *TAG = "w5500.mac";
 #define W5500_RX_MEM_SIZE (0x4000)
 #define W5500_100M_TX_TMO_US (2000)
 #define W5500_10M_TX_TMO_US  (1500)
+#define W5500_TX_DONE_TMO_MS  (10)   // SPI frame write ~480 µs + W5500 MAC + ISR + sched slack
+#define W5500_TX_QUEUE_DEPTH  (4)    // max frames queued between lwIP and the TX task
+#define W5500_TX_INLINE_THRESHOLD  (128)  // frames <= this bypass the pool/queue when TX is idle
+#define W5500_SPI_POLLING_THRESHOLD (64)  // SPI transfers > this use DMA-async (spi_device_transmit)
 #define W5500_ETH_MAC_RX_BUF_SIZE_AUTO (0)
+
+typedef struct {
+    uint8_t  *data;
+    uint32_t  len;
+} w5500_tx_frame_t;
 
 typedef struct {
     uint32_t offset;
@@ -71,6 +82,12 @@ typedef struct {
     uint8_t *rx_buffer;
     uint8_t mcast_cnt;
     uint32_t tx_tmo;
+    QueueHandle_t     tx_queue;                       // pending frames: lwIP thread → emac task
+    QueueHandle_t     tx_pool;                        // free TX frame buffer pool
+    uint8_t          *tx_pool_bufs[W5500_TX_QUEUE_DEPTH]; // backing DMA memory for pool
+    uint8_t          *tx_active_buf;                  // pool buffer in-flight (NULL for inline TX or when idle)
+    uint64_t          tx_start_us;                    // esp_timer_get_time() when SEND was issued
+    SemaphoreHandle_t tx_idle_sem;                    // binary sem (count=1 when TX idle, 0 when SEND in flight)
 } emac_w5500_t;
 
 /* Single-instance pointer used by w5500_get_diag() */
@@ -134,6 +151,10 @@ static inline bool w5500_spi_unlock(eth_spi_info_t *spi)
     return xSemaphoreGive(spi->lock) == pdTRUE;
 }
 
+// Short transfers (registers, command writes) use polling — ISR/context-switch
+// overhead outweighs DMA for < ~64 B.  Long transfers (frame data) use the
+// interrupt-driven path so the calling task sleeps during the ~300 µs DMA
+// instead of busy-waiting the single C3 core.
 static esp_err_t w5500_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *value, uint32_t len)
 {
     esp_err_t ret = ESP_OK;
@@ -146,7 +167,10 @@ static esp_err_t w5500_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
         .tx_buffer = value
     };
     if (w5500_spi_lock(spi)) {
-        if (spi_device_polling_transmit(spi->hdl, &trans) != ESP_OK) {
+        esp_err_t tx_err = (len > W5500_SPI_POLLING_THRESHOLD)
+            ? spi_device_transmit(spi->hdl, &trans)
+            : spi_device_polling_transmit(spi->hdl, &trans);
+        if (tx_err != ESP_OK) {
             ESP_LOGE(TAG, "%s(%d): spi transmit failed", __FUNCTION__, __LINE__);
             ret = ESP_FAIL;
         }
@@ -162,15 +186,19 @@ static esp_err_t w5500_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
     esp_err_t ret = ESP_OK;
     eth_spi_info_t *spi = (eth_spi_info_t *)spi_ctx;
 
+    bool use_rxdata = (len <= 4);
     spi_transaction_t trans = {
-        .flags = len <= 4 ? SPI_TRANS_USE_RXDATA : 0, // use direct reads for registers to prevent overwrites by 4-byte boundary writes
+        .flags = use_rxdata ? SPI_TRANS_USE_RXDATA : 0, // use direct reads for registers to prevent overwrites by 4-byte boundary writes
         .cmd = cmd,
         .addr = addr,
         .length = 8 * len,
         .rx_buffer = value
     };
     if (w5500_spi_lock(spi)) {
-        if (spi_device_polling_transmit(spi->hdl, &trans) != ESP_OK) {
+        esp_err_t tx_err = (!use_rxdata && len > W5500_SPI_POLLING_THRESHOLD)
+            ? spi_device_transmit(spi->hdl, &trans)
+            : spi_device_polling_transmit(spi->hdl, &trans);
+        if (tx_err != ESP_OK) {
             ESP_LOGE(TAG, "%s(%d): spi transmit failed", __FUNCTION__, __LINE__);
             ret = ESP_FAIL;
         }
@@ -178,7 +206,7 @@ static esp_err_t w5500_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
     } else {
         ret = ESP_ERR_TIMEOUT;
     }
-    if ((trans.flags & SPI_TRANS_USE_RXDATA) && len <= 4) {
+    if (use_rxdata) {
         memcpy(value, trans.rx_data, len);  // copy register values to output
     }
     return ret;
@@ -200,6 +228,19 @@ static esp_err_t w5500_write(emac_w5500_t *emac, uint32_t address, const void *d
                     | W5500_SPI_OP_MODE_VDM); // Actually it's the command phase in W5500 SPI frame
 
     return emac->spi.write(emac->spi.ctx, cmd, addr, data, len);
+}
+
+// Fire-and-forget SEND on SOCK0: writes SCR and returns without reading it
+// back.  The chip auto-clears SCR within microseconds of accepting the
+// command, but the readback costs a full SPI round-trip we don't need on the
+// TX hot path — SIR_SEND is the authoritative completion signal, caught
+// asynchronously by the emac task.  Safe because tx_idle_sem serializes
+// SENDs: the next SEND is only issued after SIR_SEND has fired for the
+// previous one, by which point SCR is long cleared.
+static inline esp_err_t w5500_issue_send(emac_w5500_t *emac)
+{
+    uint8_t cmd = W5500_SCR_SEND;
+    return w5500_write(emac, W5500_REG_SOCK_CR(0), &cmd, sizeof(cmd));
 }
 
 static esp_err_t w5500_send_command(emac_w5500_t *emac, uint8_t command, uint32_t timeout_ms)
@@ -349,8 +390,8 @@ static esp_err_t w5500_setup_default(emac_w5500_t *emac)
     /* Enable MAC RAW mode for SOCK0, enable MAC filter, no blocking broadcast and block multicast */
     reg_value = W5500_SMR_MAC_RAW | W5500_SMR_MAC_FILTER | W5500_SMR_MAC_BLOCK_MCAST;
     ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_MR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SMR failed");
-    /* Enable receive event for SOCK0 */
-    reg_value = W5500_SIR_RECV;
+    /* Enable receive and send-done events for SOCK0 */
+    reg_value = W5500_SIR_RECV | W5500_SIR_SEND;
     ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_IMR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SOCK0 IMR failed");
     /* Set the interrupt re-assert level to maximum (~1.5ms) to lower the chances of missing it */
     uint16_t int_level = __builtin_bswap16(0xFFFF);
@@ -656,65 +697,79 @@ static inline bool is_w5500_sane_for_rxtx(emac_w5500_t *emac)
    return false;
 }
 
-static esp_err_t emac_w5500_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length)
+// Pushes one frame into the W5500 TX buffer and issues SEND.  Does NOT wait
+// for SIR_SEND — caller signals that by holding tx_idle_sem; the task releases
+// the sem when the ISR-driven SIR_SEND wakes it.  Caller MUST already hold
+// tx_idle_sem before calling.
+static esp_err_t w5500_start_tx(emac_w5500_t *emac, const uint8_t *buf, uint32_t length)
 {
-    esp_err_t ret = ESP_OK;
-    emac_w5500_t *emac = __containerof(mac, emac_w5500_t, parent);
-    uint16_t offset = 0;
-
-    ESP_GOTO_ON_FALSE(length <= ETH_MAX_PACKET_SIZE, ESP_ERR_INVALID_ARG, err,
-                        TAG, "frame size is too big (actual %" PRIu32 ", maximum %u)", length, ETH_MAX_PACKET_SIZE);
-    // check if there're free memory to store this packet
     uint16_t free_size = 0;
-    ESP_GOTO_ON_ERROR(w5500_get_tx_free_size(emac, &free_size), err, TAG, "get free size failed");
+    esp_err_t err;
+    if ((err = w5500_get_tx_free_size(emac, &free_size)) != ESP_OK) return err;
     if (length > free_size) {
-        // TX buffer is stuck (previous SEND never completed, e.g. due to a link glitch mid-TX).
-        // Recover by closing and reopening SOCK0, which resets the TX/RX buffer pointers.
         ESP_LOGW(TAG, "TX stuck (free=%" PRIu16 " need=%" PRIu32 "), recovering socket", free_size, length);
-        if (w5500_reopen_socket(emac) != ESP_OK) {
-            return ESP_FAIL;  // chip not ready yet; drop frame, try again next time
-        }
-        ESP_GOTO_ON_ERROR(w5500_get_tx_free_size(emac, &free_size), err, TAG, "get free size failed");
-        ESP_GOTO_ON_FALSE(length <= free_size, ESP_ERR_NO_MEM, err, TAG,
-                          "free size (%" PRIu16 ") < send length (%" PRIu32 ") after recovery", free_size, length);
+        if ((err = w5500_reopen_socket(emac)) != ESP_OK) return err;
+        if ((err = w5500_get_tx_free_size(emac, &free_size)) != ESP_OK) return err;
+        if (length > free_size) return ESP_FAIL;
     }
-    // get current write pointer
-    ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_SOCK_TX_WR(0), &offset, sizeof(offset)), err, TAG, "read TX WR failed");
+    uint16_t offset = 0;
+    if ((err = w5500_read(emac, W5500_REG_SOCK_TX_WR(0), &offset, sizeof(offset))) != ESP_OK) return err;
     offset = __builtin_bswap16(offset);
-    // copy data to tx memory
-    ESP_GOTO_ON_ERROR(w5500_write_buffer(emac, buf, length, offset), err, TAG, "write frame failed");
-    // update write pointer
+    if ((err = w5500_write_buffer(emac, buf, length, offset)) != ESP_OK) return err;
     offset += length;
     offset = __builtin_bswap16(offset);
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_TX_WR(0), &offset, sizeof(offset)), err, TAG, "write TX WR failed");
-    // issue SEND command
-    ESP_GOTO_ON_ERROR(w5500_send_command(emac, W5500_SCR_SEND, 100), err, TAG, "issue SEND command failed");
+    if ((err = w5500_write(emac, W5500_REG_SOCK_TX_WR(0), &offset, sizeof(offset))) != ESP_OK) return err;
+    // Original way: issue command and read it back to make sure it's accepted by W5500. However, this readback costs a full SPI round-trip 
+    // and is not necessary since tx_idle_sem already guarantees that the previous SEND command has completed (and thus the W5500 is ready for the next one).
+    //if ((err = w5500_send_command(emac, W5500_SCR_SEND, 100)) != ESP_OK) return err;
 
-    // polling the TX done event
-    uint8_t status = 0;
-    uint64_t start = esp_timer_get_time();
-    uint64_t now = 0;
-    do {
-        now = esp_timer_get_time();
-        if (!is_w5500_sane_for_rxtx(emac)) {
-            return ESP_FAIL;  // link down — wait for link-up event to re-init
-        }
-        if ((now - start) > emac->tx_tmo) {
-            // SIR_SEND never arrived: W5500 may have been power-reset (all registers
-            // back to defaults — socket closed, 2KB buffers, wrong mode).
-            // Re-initialise the socket so the next frame can be sent.
-            ESP_LOGW(TAG, "TX SEND timeout — re-initialising W5500 socket");
-            w5500_reopen_socket(emac);  // best-effort; SR readback logs if chip not ready
-            return ESP_FAIL;  // drop this frame; next frame will succeed
-        }
-        ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_SOCK_IR(0), &status, sizeof(status)), err, TAG, "read SOCK0 IR failed");
-    } while (!(status & W5500_SIR_SEND));
-    // clear the event bit
-    status  = W5500_SIR_SEND;
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_IR(0), &status, sizeof(status)), err, TAG, "write SOCK0 IR failed");
+    // Just issue the command without waiting for it to take effect.
+    if ((err = w5500_issue_send(emac)) != ESP_OK) return err;
+    return ESP_OK;
+}
 
-err:
-    return ret;
+static esp_err_t emac_w5500_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length)
+{
+    emac_w5500_t *emac = __containerof(mac, emac_w5500_t, parent);
+
+    ESP_RETURN_ON_FALSE(length <= ETH_MAX_PACKET_SIZE, ESP_ERR_INVALID_ARG, TAG,
+                        "frame size is too big (actual %" PRIu32 ", maximum %u)", length, ETH_MAX_PACKET_SIZE);
+
+    // Fast path: short, DMA-capable, 4-byte-aligned frames go straight to the
+    // W5500 with no memcpy and no task handoff when the TX engine is idle AND
+    // nothing is queued ahead of us (preserves frame order wrt the queued path).
+    // For > W5500_SPI_POLLING_THRESHOLD bytes the SPI write itself uses the
+    // interrupt-driven DMA path, so the lwIP thread sleeps during the transfer
+    // instead of busy-waiting.  tx_idle_sem stays taken until the SIR_SEND ISR
+    // wakes the emac task, which releases it — lwIP returns before completion.
+    if (length <= W5500_TX_INLINE_THRESHOLD &&
+            esp_ptr_dma_capable(buf) &&
+            (((uintptr_t)buf & 0x3) == 0) &&
+            xSemaphoreTake(emac->tx_idle_sem, 0) == pdTRUE) {
+        if (uxQueueMessagesWaiting(emac->tx_queue) == 0) {
+            if (w5500_start_tx(emac, buf, length) == ESP_OK) {
+                emac->tx_start_us = esp_timer_get_time();
+                // tx_active_buf stays NULL — no pool buffer to return on completion.
+                return ESP_OK;
+            }
+        }
+        xSemaphoreGive(emac->tx_idle_sem);
+        // fall through to queued path
+    }
+
+    // Queued path: grab a free DMA buffer from the pool (wait briefly to absorb
+    // micro-bursts), copy the frame, and let the emac task drive the SPI write.
+    uint8_t *frame_buf = NULL;
+    if (xQueueReceive(emac->tx_pool, &frame_buf, pdMS_TO_TICKS(2)) != pdTRUE) {
+        ESP_LOGD(TAG, "TX pool exhausted — dropping frame");
+        return ESP_FAIL;
+    }
+
+    memcpy(frame_buf, buf, length);
+    w5500_tx_frame_t frame = { .data = frame_buf, .len = length };
+    xQueueSend(emac->tx_queue, &frame, 0);      // pool and queue are same depth — space is guaranteed
+    xTaskNotifyGive(emac->rx_task_hdl);         // wake emac_w5500_task to drain the queue
+    return ESP_OK;
 }
 
 static esp_err_t emac_w5500_alloc_recv_buf(emac_w5500_t *emac, uint8_t **buf, uint32_t *length)
@@ -865,65 +920,116 @@ static void emac_w5500_task(void *arg)
     uint32_t buf_len = 0;
     esp_err_t ret;
     while (1) {
-        /* check if the task receives any notification */
-        if (emac->int_gpio_num >= 0) {                                   // if in interrupt mode
-            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0 &&   // if no notification ...
-                gpio_get_level(emac->int_gpio_num) != 0) {               // ...and no interrupt asserted
-                continue;                                                // -> just continue to check again
-            }
+        /* Wait for a notification: either the W5500 INT pin fired (RX ready)
+         * or emac_w5500_transmit() enqueued a TX frame. */
+        bool do_hw_check;
+        if (emac->int_gpio_num >= 0) {
+            uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+            /* Check hardware if notified OR if INT is still asserted (missed-edge safety net) */
+            do_hw_check = (notified > 0) || (gpio_get_level(emac->int_gpio_num) == 0);
         } else {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            do_hw_check = true;
         }
-        /* Detect W5500 hardware reset (power glitch): socket mode reverts to
-         * 0x00 (TCP default) and buffer sizes shrink to 2KB.  The link-down
-         * debounce may be too slow to catch a fast glitch, so check here and
-         * re-initialise proactively before the TX path tries to SEND on a
-         * closed socket. */
-        uint8_t sock_mr = 0;
-        if (w5500_read(emac, W5500_REG_SOCK_MR(0), &sock_mr, sizeof(sock_mr)) == ESP_OK
-                && sock_mr != (W5500_SMR_MAC_RAW | W5500_SMR_MAC_FILTER | W5500_SMR_MAC_BLOCK_MCAST)) {
-            ESP_LOGW(TAG, "W5500 register reset detected (SOCK_MR=0x%02X) — re-initialising", sock_mr);
-            w5500_reopen_socket(emac);  // SR readback logs if chip not fully ready yet
-        }
-        /* read interrupt status */
-        w5500_read(emac, W5500_REG_SOCK_IR(0), &status, sizeof(status));
-        /* packet received */
-        if (status & W5500_SIR_RECV) {
-            status = W5500_SIR_RECV;
-            /* clear interrupt status */
-            w5500_write(emac, W5500_REG_SOCK_IR(0), &status, sizeof(status));
-            do {
-                /* define max expected frame len */
-                frame_len = ETH_MAX_PACKET_SIZE;
-                if ((ret = emac_w5500_alloc_recv_buf(emac, &buffer, &frame_len)) == ESP_OK) {
-                    if (buffer != NULL) {
-                        /* we have memory to receive the frame of maximal size previously defined */
-                        buf_len = W5500_ETH_MAC_RX_BUF_SIZE_AUTO;
-                        if (emac->parent.receive(&emac->parent, buffer, &buf_len) == ESP_OK) {
-                            if (buf_len == 0) {
-                                free(buffer);
-                            } else if (frame_len > buf_len) {
-                                ESP_LOGE(TAG, "received frame was truncated");
-                                free(buffer);
-                            } else {
-                                ESP_LOGD(TAG, "receive len=%" PRIu32, buf_len);
-                                /* pass the buffer to stack (e.g. TCP/IP layer) */
-                                emac->eth->stack_input(emac->eth, buffer, buf_len);
-                            }
-                        } else {
-                            ESP_LOGE(TAG, "frame read from module failed");
-                            free(buffer);
-                        }
-                    } else if (frame_len) {
-                        ESP_LOGE(TAG, "invalid combination of frame_len(%" PRIu32 ") and buffer pointer(%p)", frame_len, buffer);
-                    }
-                } else if (ret == ESP_ERR_NO_MEM) {
-                    ESP_LOGE(TAG, "no mem for receive buffer");
-                    emac_w5500_flush_recv_frame(emac);
-                } else {
-                    ESP_LOGE(TAG, "unexpected error 0x%x", ret);
+
+        if (do_hw_check) {
+            /* Detect W5500 hardware reset (power glitch): socket mode reverts to
+             * 0x00 (TCP default) and buffer sizes shrink to 2KB. */
+            uint8_t sock_mr = 0;
+            if (w5500_read(emac, W5500_REG_SOCK_MR(0), &sock_mr, sizeof(sock_mr)) == ESP_OK
+                    && sock_mr != (W5500_SMR_MAC_RAW | W5500_SMR_MAC_FILTER | W5500_SMR_MAC_BLOCK_MCAST)) {
+                ESP_LOGW(TAG, "W5500 register reset detected (SOCK_MR=0x%02X) — re-initialising", sock_mr);
+                w5500_reopen_socket(emac);
+            }
+
+            /* Read SOCK_IR once and dispatch both TX and RX events from it.
+             * SIR_SEND and SIR_RECV can be set simultaneously; handling them in
+             * one read avoids a second SPI transaction and prevents missed edges. */
+            w5500_read(emac, W5500_REG_SOCK_IR(0), &status, sizeof(status));
+
+            /* TX done: INT fired for SIR_SEND, or SIR_SEND was already set when
+             * we woke for SIR_RECV — caught either way in this single read.
+             * tx_active_buf is non-NULL only for the queued path; the inline
+             * path owns lwIP-provided memory, so there's no pool buffer to
+             * return there. */
+            if (status & W5500_SIR_SEND) {
+                uint8_t clr = W5500_SIR_SEND;
+                w5500_write(emac, W5500_REG_SOCK_IR(0), &clr, sizeof(clr));
+                if (emac->tx_active_buf) {
+                    xQueueSend(emac->tx_pool, &emac->tx_active_buf, 0);
+                    emac->tx_active_buf = NULL;
                 }
-            } while (emac->packets_remain);
+                xSemaphoreGive(emac->tx_idle_sem);
+            }
+
+            /* RX: drain all received frames from the W5500 RX buffer */
+            if (status & W5500_SIR_RECV) {
+                uint8_t clr = W5500_SIR_RECV;
+                w5500_write(emac, W5500_REG_SOCK_IR(0), &clr, sizeof(clr));
+                do {
+                    frame_len = ETH_MAX_PACKET_SIZE;
+                    if ((ret = emac_w5500_alloc_recv_buf(emac, &buffer, &frame_len)) == ESP_OK) {
+                        if (buffer != NULL) {
+                            buf_len = W5500_ETH_MAC_RX_BUF_SIZE_AUTO;
+                            if (emac->parent.receive(&emac->parent, buffer, &buf_len) == ESP_OK) {
+                                if (buf_len == 0) {
+                                    free(buffer);
+                                } else if (frame_len > buf_len) {
+                                    ESP_LOGE(TAG, "received frame was truncated");
+                                    free(buffer);
+                                } else {
+                                    ESP_LOGD(TAG, "receive len=%" PRIu32, buf_len);
+                                    emac->eth->stack_input(emac->eth, buffer, buf_len);
+                                }
+                            } else {
+                                ESP_LOGE(TAG, "frame read from module failed");
+                                free(buffer);
+                            }
+                        } else if (frame_len) {
+                            ESP_LOGE(TAG, "invalid combination of frame_len(%" PRIu32 ") and buffer pointer(%p)", frame_len, buffer);
+                        }
+                    } else if (ret == ESP_ERR_NO_MEM) {
+                        ESP_LOGE(TAG, "no mem for receive buffer");
+                        emac_w5500_flush_recv_frame(emac);
+                    } else {
+                        ESP_LOGE(TAG, "unexpected error 0x%x", ret);
+                    }
+                } while (emac->packets_remain);
+            }
+        }
+
+        /* TX timeout: SIR_SEND never arrived — W5500 may have been power-reset.
+         * Checked every wakeup so a 1 s notification timeout doesn't mask it.
+         * "In flight" now means tx_idle_sem is taken (either the inline path
+         * from lwIP or the queued path below is waiting for SIR_SEND). */
+        if (uxSemaphoreGetCount(emac->tx_idle_sem) == 0 &&
+                (esp_timer_get_time() - emac->tx_start_us) > (W5500_TX_DONE_TMO_MS * 1000ULL)) {
+            ESP_LOGW(TAG, "TX DONE timeout — re-initialising W5500 socket");
+            w5500_reopen_socket(emac);
+            if (emac->tx_active_buf) {
+                xQueueSend(emac->tx_pool, &emac->tx_active_buf, 0);
+                emac->tx_active_buf = NULL;
+            }
+            xSemaphoreGive(emac->tx_idle_sem);
+        }
+
+        /* Start next queued TX when the engine is idle.  Writing the frame and
+         * issuing SEND is non-blocking; SIR_SEND will be caught on the next
+         * wakeup triggered by the W5500 INT pin. */
+        if (xSemaphoreTake(emac->tx_idle_sem, 0) == pdTRUE) {
+            w5500_tx_frame_t tx_frame;
+            if (xQueueReceive(emac->tx_queue, &tx_frame, 0) == pdTRUE) {
+                if (w5500_start_tx(emac, tx_frame.data, tx_frame.len) == ESP_OK) {
+                    emac->tx_active_buf = tx_frame.data;
+                    emac->tx_start_us   = esp_timer_get_time();
+                    // tx_idle_sem stays taken until SIR_SEND ISR wakes us
+                } else {
+                    xQueueSend(emac->tx_pool, &tx_frame.data, 0);  // drop frame, return buffer
+                    xSemaphoreGive(emac->tx_idle_sem);
+                }
+            } else {
+                xSemaphoreGive(emac->tx_idle_sem);  // nothing to do
+            }
         }
     }
     vTaskDelete(NULL);
@@ -983,6 +1089,18 @@ static esp_err_t emac_w5500_del(esp_eth_mac_t *mac)
         esp_timer_delete(emac->poll_timer);
     }
     vTaskDelete(emac->rx_task_hdl);
+    if (emac->tx_queue) {
+        vQueueDelete(emac->tx_queue);
+    }
+    if (emac->tx_pool) {
+        vQueueDelete(emac->tx_pool);
+    }
+    if (emac->tx_idle_sem) {
+        vSemaphoreDelete(emac->tx_idle_sem);
+    }
+    for (int i = 0; i < W5500_TX_QUEUE_DEPTH; i++) {
+        heap_caps_free(emac->tx_pool_bufs[i]);  // safe with NULL
+    }
     emac->spi.deinit(emac->spi.ctx);
     heap_caps_free(emac->rx_buffer);
     free(emac);
@@ -1088,6 +1206,21 @@ esp_eth_mac_t *esp_eth_mac_new_w5500(const eth_w5500_config_t *w5500_config, con
                            mac_config->rx_task_prio, &emac->rx_task_hdl, core_num);
     ESP_GOTO_ON_FALSE(xReturned == pdPASS, NULL, err, TAG, "create w5500 task failed");
 
+    // TX frame buffer pool: W5500_TX_QUEUE_DEPTH DMA-capable buffers pre-allocated.
+    emac->tx_pool = xQueueCreate(W5500_TX_QUEUE_DEPTH, sizeof(uint8_t *));
+    ESP_GOTO_ON_FALSE(emac->tx_pool, NULL, err, TAG, "create TX pool queue failed");
+    for (int i = 0; i < W5500_TX_QUEUE_DEPTH; i++) {
+        emac->tx_pool_bufs[i] = heap_caps_malloc(ETH_MAX_PACKET_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        ESP_GOTO_ON_FALSE(emac->tx_pool_bufs[i], NULL, err, TAG, "allocate TX pool buffer %d failed", i);
+        xQueueSend(emac->tx_pool, &emac->tx_pool_bufs[i], 0);
+    }
+    emac->tx_queue = xQueueCreate(W5500_TX_QUEUE_DEPTH, sizeof(w5500_tx_frame_t));
+    ESP_GOTO_ON_FALSE(emac->tx_queue, NULL, err, TAG, "create TX queue failed");
+
+    // Binary semaphore with initial count = 1 (TX engine idle at boot).
+    emac->tx_idle_sem = xSemaphoreCreateCounting(1, 1);
+    ESP_GOTO_ON_FALSE(emac->tx_idle_sem, NULL, err, TAG, "create TX idle sem failed");
+
     emac->rx_buffer = heap_caps_malloc(ETH_MAX_PACKET_SIZE, MALLOC_CAP_DMA);
     ESP_GOTO_ON_FALSE(emac->rx_buffer, NULL, err, TAG, "RX buffer allocation failed");
 
@@ -1111,6 +1244,18 @@ err:
         }
         if (emac->rx_task_hdl) {
             vTaskDelete(emac->rx_task_hdl);
+        }
+        if (emac->tx_queue) {
+            vQueueDelete(emac->tx_queue);
+        }
+        if (emac->tx_pool) {
+            vQueueDelete(emac->tx_pool);
+        }
+        if (emac->tx_idle_sem) {
+            vSemaphoreDelete(emac->tx_idle_sem);
+        }
+        for (int i = 0; i < W5500_TX_QUEUE_DEPTH; i++) {
+            heap_caps_free(emac->tx_pool_bufs[i]);
         }
         if (emac->spi.ctx) {
             emac->spi.deinit(emac->spi.ctx);
