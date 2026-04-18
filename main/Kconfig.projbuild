@@ -85,5 +85,11 @@ menu "Ethernet Downlink"
         default 10
         range 1 80
         depends on ETH_DOWNLINK_W5500
+        help
+            Upper bound for SPI clock; the driver rounds DOWN to the nearest
+            divider of the 80 MHz APB clock. Achievable values: 80, 40, 26.67,
+            20, 16, 13.33, 11.43, 10, ... MHz. Setting e.g. 25 rounds to 20;
+            set 27 to land on 26.67. 80 MHz maxes out the W5500 but needs
+            clean wiring.
 
 endmenu
