@@ -32,7 +32,7 @@
 
 static const char *TAG = "w5500.mac";
 
-#define W5500_SPI_LOCK_TIMEOUT_MS (9999) 
+#define W5500_SPI_LOCK_TIMEOUT_MS (50)
 #define W5500_TX_MEM_SIZE (0x4000)
 #define W5500_RX_MEM_SIZE (0x4000)
 #define W5500_100M_TX_TMO_US (2000)

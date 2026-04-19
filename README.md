@@ -392,7 +392,7 @@ The default port is 514. The server address is resolved by DNS and re-resolved e
 
 Connect via serial at 115200 bps, or via the remote console.
 
-### Network
+### Network Config
 
 | Command | Description |
 |---------|-------------|
@@ -408,9 +408,6 @@ Connect via serial at 115200 bps, or via the remote console.
 | `set_eth_dhcps <on\|off>` | Enable or disable DHCP server (requires reboot) |
 | `set_hostname <name>` | Set DHCP hostname |
 | `set_ttl <value>` | Override TTL in forwarded packets |
-| `bytes` | Show uplink byte counters |
-| `bytes reset` | Reset byte counters |
-| `ping <host>` | Send ICMP echo requests |
 
 ### DHCP and Port Mapping
 
@@ -449,6 +446,15 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 | `set_vpn keepalive <seconds>` | Persistent keepalive interval |
 | `set_vpn killswitch <on\|off>` | Block traffic when VPN is down |
 | `set_vpn route_all <on\|off>` | Route all traffic through VPN |
+
+### Diagnosis
+
+| Command | Description |
+|---------|-------------|
+| `ping <host>` | Send ICMP echo requests |
+| `iperf -s [-u] [-p <port>] [-t <sec>]` | Run iperf server (TCP by default, `-u` for UDP) |
+| `iperf -c <ip> [-u] [-p <port>] [-t <sec>] [-i <sec>] [-b <bps>]` | Run iperf client |
+| `iperf --stop` | Stop all running iperf instances |
 
 ### Packet Capture
 

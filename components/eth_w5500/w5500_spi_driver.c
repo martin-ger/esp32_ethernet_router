@@ -51,7 +51,6 @@ typedef struct {
     SemaphoreHandle_t   lock;
     uint8_t            *tx_dma_buf;
     uint8_t            *rx_dma_buf;
-    uint32_t            isr_threshold;  // transfers > this use spi_device_transmit (ISR completion)
 } w5500_spi_ctx_t;
 
 static void *w5500_custom_spi_init(const void *cfg)
@@ -78,27 +77,12 @@ static void *w5500_custom_spi_init(const void *cfg)
         heap_caps_free(ctx->tx_dma_buf);
         vSemaphoreDelete(ctx->lock); spi_bus_remove_device(ctx->hdl); free(ctx); return NULL;
     }
-    ESP_LOGI(TAG, "DMA TX=%p RX=%p buf_size=%u tx_dma_ok=%d rx_dma_ok=%d",
+    int freq_khz = 0;
+    spi_device_get_actual_freq(ctx->hdl, &freq_khz);
+    ESP_LOGI(TAG, "DMA TX=%p RX=%p buf_size=%u tx_dma_ok=%d rx_dma_ok=%d actual SPI clock %d kHz",
              ctx->tx_dma_buf, ctx->rx_dma_buf, W5500_DMA_BUF_SIZE,
              esp_ptr_dma_capable(ctx->tx_dma_buf),
-             esp_ptr_dma_capable(ctx->rx_dma_buf));
-
-    /* Polling-vs-ISR crossover, derived from actual SPI clock.
-     * Break-even: ~15 µs ISR+context-switch overhead == transfer time (bytes*8/freq).
-     * Transfers <= threshold poll (CPU busy-waits), above use spi_device_transmit
-     * (task sleeps on sem, DMA runs autonomously, CPU free for lwIP/NAT/hooks).
-     * Clamped to [32, 512] — never ISR-mode for tiny ops, always ISR for max frames. */
-    int freq_khz = 0;
-    if (spi_device_get_actual_freq(ctx->hdl, &freq_khz) == ESP_OK && freq_khz > 0) {
-        ctx->isr_threshold = (15u * (uint32_t)freq_khz) / 8000u;
-        if (ctx->isr_threshold < 32u)  ctx->isr_threshold = 32u;
-        if (ctx->isr_threshold > 512u) ctx->isr_threshold = 512u;
-    } else {
-        ctx->isr_threshold = 128u;
-        freq_khz = 0;
-    }
-    ESP_LOGI(TAG, "SPI ISR threshold: %" PRIu32 " bytes (actual SPI clock %d kHz)",
-             ctx->isr_threshold, freq_khz);
+             esp_ptr_dma_capable(ctx->rx_dma_buf), freq_khz);
     return ctx;
 }
 
@@ -133,13 +117,7 @@ static IRAM_ATTR esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, ui
     };
     esp_err_t ret = ESP_FAIL;
     if (xSemaphoreTake(ctx->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
-        // Large DMA reads use ISR completion so CPU is free during the ~200 µs
-        // transfer — lwIP/NAT processing can run concurrently with the DMA.
-        // Small/inline transfers stay polling (context-switch overhead dominates).
-        esp_err_t tx_err = (!use_inline && spi_len > ctx->isr_threshold)
-            ? spi_device_transmit(ctx->hdl, &t)
-            : spi_device_polling_transmit(ctx->hdl, &t);
-        if (tx_err == ESP_OK) {
+        if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) {
             if (use_inline) {
                 memcpy(data, t.rx_data, len);
             } else if (!direct_dma) {
@@ -196,13 +174,7 @@ static IRAM_ATTR esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, u
                 memcpy(ctx->tx_dma_buf, data, len);
             }
         }
-        // Large DMA writes use ISR completion so CPU is free during the ~200 µs
-        // transfer — lwIP/NAT processing can run concurrently with the DMA.
-        // Small/inline writes stay polling (context-switch overhead dominates).
-        esp_err_t tx_err = (!use_inline && len > ctx->isr_threshold)
-            ? spi_device_transmit(ctx->hdl, &t)
-            : spi_device_polling_transmit(ctx->hdl, &t);
-        if (tx_err == ESP_OK) {
+        if (spi_device_polling_transmit(ctx->hdl, &t) == ESP_OK) {
             ret = ESP_OK;
         } else {
             s_stats.write_spi_fail++;

@@ -50,6 +50,7 @@ extern void    web_ui_set_bind(uint8_t bind);
 #include "syslog_client.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
+#include "iperf.h"
 
 #ifdef CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
 #define WITH_TASKS_INFO 1
@@ -70,7 +71,7 @@ static void register_portmap(void);
 static void register_dhcp_reserve(void);
 static void register_set_router_password(void);
 static void register_web_ui(void);
-static void register_bytes(void);
+static void register_iperf(void);
 static void register_pcap(void);
 static void register_set_led_gpio(void);
 static void register_set_led_lowactive(void);
@@ -278,7 +279,7 @@ void register_router(void)
     register_dhcp_reserve();
     register_portmap();
     register_acl();
-    register_bytes();
+    register_iperf();
     register_pcap();
     register_web_ui();
     register_set_router_password();
@@ -1652,53 +1653,97 @@ static void register_dhcp_reserve(void)
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
 
-/* 'bytes' command */
+/* 'iperf' command — minimal wrapper around espressif/iperf component */
 static struct {
-    struct arg_str* action;
-    struct arg_end* end;
-} bytes_args;
+    struct arg_lit *server;
+    struct arg_str *client;
+    struct arg_lit *udp;
+    struct arg_lit *stop;
+    struct arg_int *port;
+    struct arg_int *time;
+    struct arg_int *interval;
+    struct arg_int *bw;
+    struct arg_end *end;
+} iperf_args;
 
-static int bytes(int argc, char **argv)
+static int iperf_cmd(int argc, char **argv)
 {
-    int nerrors = arg_parse(argc, argv, (void **) &bytes_args);
+    int nerrors = arg_parse(argc, argv, (void **) &iperf_args);
     if (nerrors != 0) {
-        arg_print_errors(stderr, bytes_args.end, argv[0]);
+        arg_print_errors(stderr, iperf_args.end, argv[0]);
         return 1;
     }
 
-    if (bytes_args.action->count == 0) {
-        // Show current byte counts
-        printf("STA Interface Byte Counts:\n");
-        printf("  Sent:     %" PRIu64 " bytes\n", get_sta_bytes_sent());
-        printf("  Received: %" PRIu64 " bytes\n", get_sta_bytes_received());
+    if (iperf_args.stop->count > 0) {
+        esp_err_t err = iperf_stop_instance(IPERF_ALL_INSTANCES_ID);
+        printf(err == ESP_OK ? "iperf stopped\n" : "no iperf instance running\n");
         return 0;
     }
 
-    const char *action = bytes_args.action->sval[0];
-    if (strcmp(action, "reset") == 0) {
-        reset_sta_byte_counts();
-        printf("Byte counts reset to zero\n");
-    } else {
-        printf("Usage: bytes [reset]\n");
-        printf("  bytes     - Show current byte counts\n");
-        printf("  bytes reset - Reset byte counts to zero\n");
+    bool is_server = iperf_args.server->count > 0;
+    bool is_client = iperf_args.client->count > 0;
+    if (is_server == is_client) {
+        printf("Usage: iperf -s | -c <ip> [-u] [-p port] [-t sec] [-i sec] [-b bps] | iperf stop\n");
         return 1;
     }
 
+    uint32_t proto = (iperf_args.udp->count > 0) ? IPERF_FLAG_UDP : IPERF_FLAG_TCP;
+    esp_ip_addr_t ip = { 0 };
+
+    if (is_client) {
+        ip4_addr_t a;
+        if (!ip4addr_aton(iperf_args.client->sval[0], &a)) {
+            printf("invalid client IP: %s\n", iperf_args.client->sval[0]);
+            return 1;
+        }
+        ip.type = ESP_IPADDR_TYPE_V4;
+        ip.u_addr.ip4.addr = a.addr;
+    } else {
+        ip.type = ESP_IPADDR_TYPE_V4;
+        ip.u_addr.ip4.addr = IPADDR_ANY;
+    }
+
+    iperf_cfg_t cfg = is_client
+        ? (iperf_cfg_t)IPERF_DEFAULT_CONFIG_CLIENT(proto, ip)
+        : (iperf_cfg_t)IPERF_DEFAULT_CONFIG_SERVER(proto, ip);
+
+    if (iperf_args.port->count > 0) {
+        uint16_t p = (uint16_t)iperf_args.port->ival[0];
+        if (is_client) cfg.dport = p; else cfg.sport = p;
+    }
+    if (iperf_args.time->count > 0)     cfg.time = iperf_args.time->ival[0];
+    if (iperf_args.interval->count > 0) cfg.interval = iperf_args.interval->ival[0];
+    if (iperf_args.bw->count > 0)       cfg.bw_lim = iperf_args.bw->ival[0];
+
+    iperf_id_t id = iperf_start_instance(&cfg);
+    if (id < 0) {
+        printf("iperf start failed\n");
+        return 1;
+    }
+    printf("iperf %s (%s) started, id=%d\n",
+           is_client ? "client" : "server",
+           (proto == IPERF_FLAG_UDP) ? "UDP" : "TCP", id);
     return 0;
 }
 
-static void register_bytes(void)
+static void register_iperf(void)
 {
-    bytes_args.action = arg_str0(NULL, NULL, "[reset]", "reset byte counts or show current counts");
-    bytes_args.end = arg_end(1);
+    iperf_args.server   = arg_lit0("s", "server",   "run as server");
+    iperf_args.client   = arg_str0("c", "client",   "<ip>", "run as client to <ip>");
+    iperf_args.udp      = arg_lit0("u", "udp",      "use UDP (default TCP)");
+    iperf_args.stop     = arg_lit0(NULL, "stop",    "stop all running iperf instances");
+    iperf_args.port     = arg_int0("p", "port",     "<port>", "TCP/UDP port (default 5001)");
+    iperf_args.time     = arg_int0("t", "time",     "<sec>",  "test duration (default 30)");
+    iperf_args.interval = arg_int0("i", "interval", "<sec>",  "report interval (default 3)");
+    iperf_args.bw       = arg_int0("b", "bw",       "<bps>",  "bandwidth limit in bits/sec");
+    iperf_args.end      = arg_end(4);
 
     const esp_console_cmd_t cmd = {
-        .command = "bytes",
-        .help = "Show or reset STA interface byte counts",
+        .command = "iperf",
+        .help = "Run iperf2 server or client (TCP/UDP)",
         .hint = NULL,
-        .func = &bytes,
-        .argtable = &bytes_args
+        .func = &iperf_cmd,
+        .argtable = &iperf_args
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
@@ -2284,13 +2329,13 @@ static int w5500_cmd(int argc, char **argv)
         printf("  RX buffer    : pending=%5u      RD=0x%04X  WR=0x%04X\n",
                d.rx_rsr, d.rx_rd, d.rx_wr);
 
-        /* Interrupts — expected: SIMR=0x01, SOCK0_IMR bits[4:0]=0x04 (RECV only).
+        /* Interrupts — expected: SIMR=0x01, SOCK0_IMR bits[4:0]=0x14 (RECV+SEND).
          * Bits [7:5] of Sn_IMR are reserved and always read back as 1 (0xE0),
-         * so the normal read-back value is 0xE4, not 0x04. */
+         * so the normal read-back value is 0xF4, not 0x14. */
         printf("  Interrupts   : SIMR=0x%02X  SOCK0_IR=0x%02X  SOCK0_IMR=0x%02X\n",
                d.simr, d.sock_ir, d.sock_imr);
         if (d.simr != 0x01)   printf("  *** SIMR is 0x%02X, expected 0x01 (SOCK0 only)\n", d.simr);
-        if ((d.sock_imr & 0x1F) != 0x04) printf("  *** SOCK0_IMR is 0x%02X, effective 0x%02X, expected 0x04 (RECV only)\n", d.sock_imr, d.sock_imr & 0x1F);
+        if ((d.sock_imr & 0x1F) != 0x14) printf("  *** SOCK0_IMR is 0x%02X, effective 0x%02X, expected 0x14 (RECV+SEND)\n", d.sock_imr, d.sock_imr & 0x1F);
         if (d.sock_ir & 0x10) printf("  *** SEND-done IRQ still pending (SIR_SEND) — TX may have timed out\n");
         if (d.sock_ir & 0x04) printf("  *** RECV IRQ pending (SIR_RECV) — unprocessed RX data\n");
 

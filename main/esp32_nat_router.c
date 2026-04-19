@@ -456,8 +456,7 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
 
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
     // Run one step above lwIP (18) so the W5500 INT wakeup immediately preempts
-    // tcpip_thread — critical for draining the 16 KB RX FIFO before overflow and
-    // for starting the next TX frame without queuing behind lwIP processing.
+    // tcpip_thread — critical for draining the 16 KB RX FIFO before overflow.
     mac_config.rx_task_prio = 19;
     esp_eth_mac_t *eth_mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
 
