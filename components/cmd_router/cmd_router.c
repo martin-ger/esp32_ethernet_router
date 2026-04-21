@@ -31,6 +31,7 @@
 #error "IP_NAPT must be defined"
 #endif
 #include "lwip/lwip_napt.h"
+#include "lwip/sockets.h"
 
 #include "mbedtls/sha256.h"
 #include "esp_random.h"
@@ -92,6 +93,7 @@ static void register_syslog_cmd(void);
 static void register_scan(void);
 static void register_set_vpn(void);
 static void register_set_tz(void);
+static void register_wol(void);
 
 /* ACL helper functions (forward declarations) */
 static char* acl_format_ip_with_name(uint32_t ip, uint32_t mask, char* buf, size_t buf_len);
@@ -298,6 +300,7 @@ void register_router(void)
     register_syslog_cmd();
     register_set_tz();
     register_set_vpn();
+    register_wol();
 }
 
 /** Arguments used by 'set_sta' function */
@@ -3138,4 +3141,126 @@ static void register_set_vpn(void)
         .argtable = &set_vpn_args
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'wol' command arguments */
+static struct {
+    struct arg_str *mac;
+    struct arg_str *ip;
+    struct arg_int *port;
+    struct arg_str *iface;
+    struct arg_end *end;
+} wol_args;
+
+/* Parse "AA:BB:CC:DD:EE:FF" or "AA-BB-CC-DD-EE-FF" into 6-byte array. Returns true on success. */
+static bool parse_mac_addr(const char *str, uint8_t mac[6])
+{
+    unsigned int b[6];
+    if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6 ||
+        sscanf(str, "%02x-%02x-%02x-%02x-%02x-%02x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+        for (int i = 0; i < 6; i++) mac[i] = (uint8_t)b[i];
+        return true;
+    }
+    return false;
+}
+
+static int wol_cmd(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&wol_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, wol_args.end, argv[0]);
+        return 1;
+    }
+
+    uint8_t mac[6];
+    if (!parse_mac_addr(wol_args.mac->sval[0], mac)) {
+        printf("Invalid MAC address. Use format AA:BB:CC:DD:EE:FF\n");
+        return 1;
+    }
+
+    /* Build magic packet: 6 x 0xFF + 16 x target MAC */
+    uint8_t pkt[102];
+    memset(pkt, 0xFF, 6);
+    for (int i = 0; i < 16; i++) {
+        memcpy(pkt + 6 + i * 6, mac, 6);
+    }
+
+    const char *dest_ip = (wol_args.ip->count > 0) ? wol_args.ip->sval[0] : "255.255.255.255";
+    int dest_port = (wol_args.port->count > 0) ? wol_args.port->ival[0] : 9;
+
+    /* Determine source bind address — default to ETH downlink so broadcast stays on the LAN.
+       Without binding, lwIP routes 255.255.255.255 out the default-route interface (STA). */
+    uint32_t bind_ip = my_ap_ip;  /* ETH downlink by default */
+    const char *iface_name = "eth";
+    if (wol_args.iface->count > 0 && strcmp(wol_args.iface->sval[0], "sta") == 0) {
+        bind_ip = my_ip;
+        iface_name = "sta";
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        printf("Failed to create socket: %d\n", errno);
+        return 1;
+    }
+
+    int broadcast = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+    /* Bind to the chosen interface IP so lwIP selects the correct outgoing netif */
+    struct sockaddr_in bind_addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(0),
+        .sin_addr.s_addr = bind_ip,
+    };
+    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        printf("Failed to bind to %s interface: %d\n", iface_name, errno);
+        close(sock);
+        return 1;
+    }
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons((uint16_t)dest_port),
+    };
+    inet_aton(dest_ip, &addr.sin_addr);
+
+    /* Send 3 times with 100 ms gaps — UDP is unreliable and the NIC may miss one */
+    int ok = 0;
+    for (int i = 0; i < 3; i++) {
+        int sent = sendto(sock, pkt, sizeof(pkt), 0,
+                          (struct sockaddr *)&addr, sizeof(addr));
+        if (sent == sizeof(pkt)) ok++;
+        if (i < 2) vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    close(sock);
+
+    if (ok == 0) {
+        printf("Send failed: %d\n", errno);
+        return 1;
+    }
+
+    printf("WoL magic packet sent to %02X:%02X:%02X:%02X:%02X:%02X via %s:%d on %s (%d/3 ok)\n",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+           dest_ip, dest_port, iface_name, ok);
+    return 0;
+}
+
+static void register_wol(void)
+{
+    wol_args.mac   = arg_str1(NULL, NULL,   "<mac>",   "Target MAC address (AA:BB:CC:DD:EE:FF)");
+    wol_args.ip    = arg_str0("i", "ip",    "<ip>",    "Destination IP (default 255.255.255.255)");
+    wol_args.port  = arg_int0("p", "port",  "<port>",  "UDP port (default 9)");
+    wol_args.iface = arg_str0("I", "iface", "<iface>", "Interface: eth (default) or sta");
+    wol_args.end   = arg_end(4);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "wol",
+        .help     = "Send Wake-on-LAN magic packet to a MAC address (default: via ETH downlink)",
+        .hint     = NULL,
+        .func     = &wol_cmd,
+        .argtable = &wol_args
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
