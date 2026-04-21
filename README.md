@@ -72,9 +72,9 @@ The WT32-ETH01 is an ESP32-based module with an integrated LAN8720 Ethernet PHY.
 
 ## Hardware — W5500 + ESP32-C3
 
-As a hardware alternative the router can run on an **ESP32-C3** with an external **W5500 SPI Ethernet module**. Be aware that this hardware is much less performant than the WT32-ETH01 (about 4 mbps downstream / 1 mbps upstream, recommended only for real IoT use cases). It uses SPI to send and receive ethernet frames, it has only one CPU core, lower clock rate, and less RAM. There are precompiled binaries for an **ESP32-C3 SuperMini** board with the SPI connections as given below. If your setup differs, adjust the config.
+As a hardware alternative the router can run on an **ESP32-C3** with an external **W5500 SPI Ethernet module**. It uses SPI to send and receive ethernet frames, so the SPI clock frequency is critical here. There are precompiled binaries for an **ESP32-C3 SuperMini** board with the SPI connections as given below. If your setup differs, adjust the config.
 
-**Caution:** The WiFi signal on an **ESP32-C3 SuperMini** board is often critical due to antenna issues. Typical symptoms can be, that you cannot connect to an AP correctly, even if you see it in a scan. Consider LOWERING the TX power with e.g. `set_tx_power 15`, as the signal gets distorted under max gain. If this doesn't help, search also the internet for possible DIY antenna fixes.
+**Caution:** The WiFi signal on an **ESP32-C3 SuperMini** board is sometimes critical due to antenna issues. Typical symptoms can be, that you cannot connect to an AP correctly, even if you see it in a scan. Consider LOWERING the TX power with e.g. `set_tx_power 15`, as the signal gets distorted under max gain. If this doesn't help, search also the internet for possible DIY antenna fixes.
 
 | Parameter | Value |
 |-----------|-------|
