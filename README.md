@@ -229,6 +229,17 @@ portmap del UDP <external_port>
 
 Only available when NAT is enabled. Rules persist in NVS.
 
+### Wake-on-LAN
+
+```
+wol <AA:BB:CC:DD:EE:FF>
+wol <AA:BB:CC:DD:EE:FF> -i <ip>      # unicast to a specific host instead of broadcast
+wol <AA:BB:CC:DD:EE:FF> -p <port>    # alternate UDP port (default 9)
+wol <AA:BB:CC:DD:EE:FF> -I sta       # send via WiFi uplink instead of Ethernet downlink
+```
+
+Sends a WoL magic packet to the given MAC address. The packet goes out the **Ethernet downlink** by default — binding to the ETH interface IP ensures the broadcast reaches LAN clients instead of leaking to the WiFi uplink. Use `-I sta` to send via the WiFi uplink instead. The packet is transmitted three times with 100 ms between each send to improve delivery reliability over UDP. Both `:` and `-` MAC separators are accepted.
+
 ### Other Network Settings
 
 ```
@@ -408,6 +419,8 @@ Connect via serial at 115200 bps, or via the remote console.
 | `set_eth_dhcps <on\|off>` | Enable or disable DHCP server (requires reboot) |
 | `set_hostname <name>` | Set DHCP hostname |
 | `set_ttl <value>` | Override TTL in forwarded packets |
+| `ping <host>` | Send ICMP echo requests |
+| `wol <mac> [-i <ip>] [-p <port>] [-I eth\|sta]` | Send Wake-on-LAN magic packet (default: ETH downlink) |
 
 ### DHCP and Port Mapping
 
