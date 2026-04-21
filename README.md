@@ -422,6 +422,7 @@ Connect via serial at 115200 bps, or via the remote console.
 | `bytes` | Show uplink byte counters |
 | `bytes reset` | Reset byte counters |
 | `ping <host>` | Send ICMP echo requests |
+| `wol <mac> [-i <ip>] [-p <port>] [-I eth\|sta]` | Send Wake-on-LAN magic packet (default: ETH downlink) |
 
 ### DHCP and Port Mapping
 
@@ -432,7 +433,6 @@ Connect via serial at 115200 bps, or via the remote console.
 | `dhcp_reserve del <mac>` | Remove DHCP reservation |
 | `portmap add <TCP\|UDP> <ext_port> <int_ip> <int_port>` | Add port forward rule |
 | `portmap del <TCP\|UDP> <ext_port>` | Remove port forward rule |
-| `wol <mac> [-i <ip>] [-p <port>] [-I eth\|sta]` | Send Wake-on-LAN magic packet (default: ETH downlink) |
 
 ### Firewall
 
