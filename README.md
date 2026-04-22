@@ -102,6 +102,10 @@ The following setup is known to work and uses the C3's native SPI pins:
 
 <img src="https://raw.githubusercontent.com/martin-ger/esp32_ethernet_router/refs/heads/main/W5500-ESP32C3.png">
 
+On custom PCB:
+
+<img src="https://raw.githubusercontent.com/martin-ger/esp32_ethernet_router/refs/heads/main/ESP32c3SuperMiniW5500.jpg">
+
 ### Build
 
 ```bash
