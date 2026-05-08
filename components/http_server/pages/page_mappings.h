@@ -48,6 +48,8 @@ select { cursor: pointer; }\
 .select-button { background: linear-gradient(135deg, #43a047 0%, #2e7d32 100%); color: #fff; border: none; border-radius: 6px; padding: 0.4rem 0.8rem; font-size: 0.8rem; font-weight: 600; cursor: pointer; transition: all 0.3s; box-shadow: 0 2px 8px rgba(67, 160, 71, 0.4); text-decoration: none; display: inline-block; }\
 .select-button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(67, 160, 71, 0.6); }\
 .green-button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(76, 175, 80, 0.6); }\
+.wake-button { background: linear-gradient(135deg, #fb8c00 0%, #e65100 100%); color: #fff; border: none; border-radius: 6px; padding: 0.4rem 0.8rem; font-size: 0.8rem; font-weight: 600; cursor: pointer; transition: all 0.3s; box-shadow: 0 2px 8px rgba(251, 140, 0, 0.4); text-decoration: none; display: inline-block; }\
+.wake-button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(251, 140, 0, 0.6); }\
 </style>\
 <script>\
 function fillDhcpForm(mac, ip, name) {\

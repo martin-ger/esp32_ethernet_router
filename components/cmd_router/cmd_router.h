@@ -8,12 +8,24 @@
 */
 #pragma once
 
+#include <stdint.h>
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Register router functions
 void register_router(void);
+
+/**
+ * @brief Send a Wake-on-LAN magic packet
+ * @param mac      Target MAC address (6 bytes)
+ * @param bind_ip  Source interface IP to bind to (network byte order)
+ * @param dest_ip_str  Destination IP string (e.g. "255.255.255.255")
+ * @param dest_port    UDP destination port (typically 9)
+ * @return true if at least one of three sends succeeded
+ */
+bool wol_send_mac(const uint8_t mac[6], uint32_t bind_ip, const char *dest_ip_str, int dest_port);
 
 #ifdef __cplusplus
 }

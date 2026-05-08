@@ -36,6 +36,7 @@
 #include "pages.h"
 #include "favicon_png.h"
 #include "router_globals.h"
+#include "cmd_router.h"
 #include "pcap_capture.h"
 #include "acl.h"
 #include "remote_console.h"
@@ -1714,6 +1715,21 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
                 }
             }
 
+            /* Check for WoL request */
+            if (httpd_query_key_value(buf, "wol_mac", param1, sizeof(param1)) == ESP_OK) {
+                preprocess_string(param1);
+                unsigned int mac[6];
+                if (sscanf(param1, "%02X:%02X:%02X:%02X:%02X:%02X",
+                           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6 ||
+                    sscanf(param1, "%02x:%02x:%02x:%02x:%02x:%02x",
+                           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+                    uint8_t mac_bytes[6];
+                    for (int i = 0; i < 6; i++) mac_bytes[i] = (uint8_t)mac[i];
+                    bool ok = wol_send_mac(mac_bytes, my_ap_ip, "255.255.255.255", 9);
+                    ESP_LOGI(TAG, "WoL %s for %s", ok ? "sent" : "failed", param1);
+                }
+            }
+
             /* Check for add port mapping */
             if (httpd_query_key_value(buf, "port_action", param1, sizeof(param1)) == ESP_OK) {
                 if (strcmp(param1, "Add+Forward") == 0 || strcmp(param1, "Add Forward") == 0) {
@@ -1797,7 +1813,7 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
     }
 
     /* Reusable buffer for building individual rows */
-    char row[384];
+    char row[512];
 
     /* --- Begin chunked response --- */
 
@@ -1926,13 +1942,20 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
                     "<td>%02X:%02X:%02X:%02X:%02X:%02X</td>"
                     "<td>%s</td>"
                     "<td>%s</td>"
-                    "<td><a href='/mappings?del_dhcp_mac=%02X:%02X:%02X:%02X:%02X:%02X' class='red-button'>Delete</a></td>"
+                    "<td style='white-space:nowrap'>"
+                    "<a href='/mappings?wol_mac=%02X:%02X:%02X:%02X:%02X:%02X' class='wake-button'>Wake</a>"
+                    " "
+                    "<a href='/mappings?del_dhcp_mac=%02X:%02X:%02X:%02X:%02X:%02X' class='red-button'>Delete</a>"
+                    "</td>"
                     "</tr>",
                     dhcp_reservations[i].mac[0], dhcp_reservations[i].mac[1],
                     dhcp_reservations[i].mac[2], dhcp_reservations[i].mac[3],
                     dhcp_reservations[i].mac[4], dhcp_reservations[i].mac[5],
                     ip_col,
                     dhcp_reservations[i].name[0] ? dhcp_reservations[i].name : "-",
+                    dhcp_reservations[i].mac[0], dhcp_reservations[i].mac[1],
+                    dhcp_reservations[i].mac[2], dhcp_reservations[i].mac[3],
+                    dhcp_reservations[i].mac[4], dhcp_reservations[i].mac[5],
                     dhcp_reservations[i].mac[0], dhcp_reservations[i].mac[1],
                     dhcp_reservations[i].mac[2], dhcp_reservations[i].mac[3],
                     dhcp_reservations[i].mac[4], dhcp_reservations[i].mac[5]

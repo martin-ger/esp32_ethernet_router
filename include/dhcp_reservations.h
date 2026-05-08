@@ -76,6 +76,14 @@ const char* lookup_device_name_by_mac(const uint8_t *mac);
  */
 bool resolve_device_name_to_ip(const char *name, uint32_t *ip);
 
+/**
+ * @brief Resolve a device name to a MAC address from DHCP reservations
+ * @param name Device name to look up (case-insensitive)
+ * @param mac Output MAC address (6 bytes)
+ * @return true if found, false if no reservation with that name
+ */
+bool resolve_device_name_to_mac(const char *name, uint8_t mac[6]);
+
 void get_dhcp_pool_range(uint32_t server_ip, uint32_t *start_ip, uint32_t *end_ip);
 void print_dhcp_pool(void);
 

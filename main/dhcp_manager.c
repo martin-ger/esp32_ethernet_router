@@ -237,6 +237,21 @@ bool resolve_device_name_to_ip(const char *name, uint32_t *ip) {
     return false;
 }
 
+bool resolve_device_name_to_mac(const char *name, uint8_t mac[6]) {
+    if (name == NULL || mac == NULL) {
+        return false;
+    }
+    for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
+        if (dhcp_reservations[i].valid &&
+            dhcp_reservations[i].name[0] != '\0' &&
+            strcasecmp(dhcp_reservations[i].name, name) == 0) {
+            memcpy(mac, dhcp_reservations[i].mac, 6);
+            return true;
+        }
+    }
+    return false;
+}
+
 int get_connected_clients(connected_client_t *clients, int max_clients) {
     if (clients == NULL || max_clients <= 0) {
         return 0;

@@ -38,6 +38,7 @@
 
 #include "driver/gpio.h"
 #include "router_globals.h"
+#include "dhcp_reservations.h"
 #include "cmd_router.h"
 #if defined(CONFIG_ETH_DOWNLINK_W5500)
 #include "w5500_spi_driver.h"
@@ -3211,6 +3212,47 @@ static bool parse_mac_addr(const char *str, uint8_t mac[6])
     return false;
 }
 
+bool wol_send_mac(const uint8_t mac[6], uint32_t bind_ip, const char *dest_ip_str, int dest_port)
+{
+    uint8_t pkt[102];
+    memset(pkt, 0xFF, 6);
+    for (int i = 0; i < 16; i++) {
+        memcpy(pkt + 6 + i * 6, mac, 6);
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) return false;
+
+    int broadcast = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+    struct sockaddr_in bind_addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(0),
+        .sin_addr.s_addr = bind_ip,
+    };
+    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        close(sock);
+        return false;
+    }
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons((uint16_t)dest_port),
+    };
+    inet_aton(dest_ip_str, &addr.sin_addr);
+
+    int ok = 0;
+    for (int i = 0; i < 3; i++) {
+        int sent = sendto(sock, pkt, sizeof(pkt), 0,
+                          (struct sockaddr *)&addr, sizeof(addr));
+        if (sent == (int)sizeof(pkt)) ok++;
+        if (i < 2) vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    close(sock);
+    return ok > 0;
+}
+
 static int wol_cmd(int argc, char **argv)
 {
     int nerrors = arg_parse(argc, argv, (void **)&wol_args);
@@ -3220,89 +3262,48 @@ static int wol_cmd(int argc, char **argv)
     }
 
     uint8_t mac[6];
-    if (!parse_mac_addr(wol_args.mac->sval[0], mac)) {
-        printf("Invalid MAC address. Use format AA:BB:CC:DD:EE:FF\n");
-        return 1;
-    }
-
-    /* Build magic packet: 6 x 0xFF + 16 x target MAC */
-    uint8_t pkt[102];
-    memset(pkt, 0xFF, 6);
-    for (int i = 0; i < 16; i++) {
-        memcpy(pkt + 6 + i * 6, mac, 6);
+    const char *target = wol_args.mac->sval[0];
+    if (!parse_mac_addr(target, mac)) {
+        if (!resolve_device_name_to_mac(target, mac)) {
+            printf("Unknown target '%s'. Provide a MAC address (AA:BB:CC:DD:EE:FF) or a known device name.\n", target);
+            return 1;
+        }
+        printf("Resolved '%s' → %02X:%02X:%02X:%02X:%02X:%02X\n",
+               target, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 
     const char *dest_ip = (wol_args.ip->count > 0) ? wol_args.ip->sval[0] : "255.255.255.255";
     int dest_port = (wol_args.port->count > 0) ? wol_args.port->ival[0] : 9;
 
-    /* Determine source bind address — default to ETH downlink so broadcast stays on the LAN.
-       Without binding, lwIP routes 255.255.255.255 out the default-route interface (STA). */
-    uint32_t bind_ip = my_ap_ip;  /* ETH downlink by default */
+    uint32_t bind_ip = my_ap_ip;
     const char *iface_name = "eth";
     if (wol_args.iface->count > 0 && strcmp(wol_args.iface->sval[0], "sta") == 0) {
         bind_ip = my_ip;
         iface_name = "sta";
     }
 
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        printf("Failed to create socket: %d\n", errno);
+    if (!wol_send_mac(mac, bind_ip, dest_ip, dest_port)) {
+        printf("WoL send failed\n");
         return 1;
     }
 
-    int broadcast = 1;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
-
-    /* Bind to the chosen interface IP so lwIP selects the correct outgoing netif */
-    struct sockaddr_in bind_addr = {
-        .sin_family      = AF_INET,
-        .sin_port        = htons(0),
-        .sin_addr.s_addr = bind_ip,
-    };
-    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        printf("Failed to bind to %s interface: %d\n", iface_name, errno);
-        close(sock);
-        return 1;
-    }
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port   = htons((uint16_t)dest_port),
-    };
-    inet_aton(dest_ip, &addr.sin_addr);
-
-    /* Send 3 times with 100 ms gaps — UDP is unreliable and the NIC may miss one */
-    int ok = 0;
-    for (int i = 0; i < 3; i++) {
-        int sent = sendto(sock, pkt, sizeof(pkt), 0,
-                          (struct sockaddr *)&addr, sizeof(addr));
-        if (sent == sizeof(pkt)) ok++;
-        if (i < 2) vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    close(sock);
-
-    if (ok == 0) {
-        printf("Send failed: %d\n", errno);
-        return 1;
-    }
-
-    printf("WoL magic packet sent to %02X:%02X:%02X:%02X:%02X:%02X via %s:%d on %s (%d/3 ok)\n",
+    printf("WoL magic packet sent to %02X:%02X:%02X:%02X:%02X:%02X via %s:%d on %s\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-           dest_ip, dest_port, iface_name, ok);
+           dest_ip, dest_port, iface_name);
     return 0;
 }
 
 static void register_wol(void)
 {
-    wol_args.mac   = arg_str1(NULL, NULL,   "<mac>",   "Target MAC address (AA:BB:CC:DD:EE:FF)");
-    wol_args.ip    = arg_str0("i", "ip",    "<ip>",    "Destination IP (default 255.255.255.255)");
-    wol_args.port  = arg_int0("p", "port",  "<port>",  "UDP port (default 9)");
-    wol_args.iface = arg_str0("I", "iface", "<iface>", "Interface: eth (default) or sta");
+    wol_args.mac   = arg_str1(NULL, NULL,   "<mac|name>", "Target MAC address (AA:BB:CC:DD:EE:FF) or DHCP reservation name");
+    wol_args.ip    = arg_str0("i", "ip",    "<ip>",       "Destination IP (default 255.255.255.255)");
+    wol_args.port  = arg_int0("p", "port",  "<port>",     "UDP port (default 9)");
+    wol_args.iface = arg_str0("I", "iface", "<iface>",    "Interface: eth (default) or sta");
     wol_args.end   = arg_end(4);
 
     const esp_console_cmd_t cmd = {
         .command  = "wol",
-        .help     = "Send Wake-on-LAN magic packet to a MAC address (default: via ETH downlink)",
+        .help     = "Send Wake-on-LAN magic packet to a MAC address or DHCP reservation name (default: via ETH downlink)",
         .hint     = NULL,
         .func     = &wol_cmd,
         .argtable = &wol_args
