@@ -93,3 +93,26 @@ menu "Ethernet Downlink"
             clean wiring.
 
 endmenu
+
+menu "MQTT Home Assistant"
+
+    config MQTT_HOMEASSISTANT
+        bool "Enable MQTT Home Assistant integration"
+        default n
+        help
+            Publishes router telemetry to an MQTT broker with Home Assistant
+            auto-discovery. Adds ~58 KB flash — disable on C3 SuperMini if
+            flash is tight. RAM is only used when a broker is configured.
+
+    config MQTT_HA_BUFFER_SIZE
+        int "MQTT buffer size (bytes)"
+        default 1024
+        depends on MQTT_HOMEASSISTANT
+
+    config MQTT_DEFAULT_INTERVAL
+        int "Default publish interval (seconds)"
+        default 30
+        range 5 3600
+        depends on MQTT_HOMEASSISTANT
+
+endmenu

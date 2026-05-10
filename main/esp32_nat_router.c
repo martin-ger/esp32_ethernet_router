@@ -70,6 +70,10 @@
 #include "remote_console.h"
 #include "syslog_client.h"
 #include "led_strip_status.h"
+#include "mdns.h"
+#ifdef CONFIG_MQTT_HOMEASSISTANT
+#include "mqtt_ha.h"
+#endif
 
 // Byte counting variables
 uint64_t sta_bytes_sent = 0;
@@ -266,11 +270,21 @@ static void initialize_console(void)
 #endif
 }
 
-// No BOOT button on WT32-ETH01 (GPIO0 used by Ethernet clock)
-#define POLL_INTERVAL_MS      50
+#define POLL_INTERVAL_MS         50
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+// ESP32-C3 SuperMini: BOOT button is GPIO9
+#define BOOT_BUTTON_GPIO         9
+#define FACTORY_RESET_HOLD_MS    5000
+#endif
 
 void * led_status_thread(void * p)
 {
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+    gpio_reset_pin(BOOT_BUTTON_GPIO);
+    gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
+#endif
+
     bool led_enabled = (led_gpio >= 0);
     if (led_enabled) {
         ESP_LOGI(TAG, "LED status on GPIO %d%s", led_gpio, led_lowactive ? " (low-active)" : "");
@@ -280,12 +294,13 @@ void * led_status_thread(void * p)
         ESP_LOGI(TAG, "LED status disabled (no GPIO configured)");
     }
 
+    int held_ms = 0;
     bool strip_active = led_strip_is_active();
 
     while (true)
     {
         // --- LED status: OFF=disconnected, ON=connected (packet hooks flicker it off) ---
-        if (led_enabled) {
+        if (led_enabled && held_ms == 0) {
             gpio_set_level(led_gpio, ap_connect ^ led_lowactive);
         }
 
@@ -297,6 +312,34 @@ void * led_status_thread(void * p)
             if (strip_active) {
                 led_strip_status_update();
             }
+
+#if defined(CONFIG_ETH_DOWNLINK_W5500)
+            if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+                held_ms += POLL_INTERVAL_MS;
+                if (led_enabled) {
+                    gpio_set_level(led_gpio, ((held_ms / POLL_INTERVAL_MS) % 2) ^ led_lowactive);
+                }
+                if (strip_active) {
+                    led_strip_set_factory_reset(true);
+                }
+                if (held_ms >= FACTORY_RESET_HOLD_MS) {
+                    ESP_LOGW(TAG, "BOOT button held %d ms — factory reset!", held_ms);
+                    nvs_handle_t nvs;
+                    if (nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+                        nvs_erase_all(nvs);
+                        nvs_commit(nvs);
+                        nvs_close(nvs);
+                    }
+                    esp_wifi_restore();
+                    esp_restart();
+                }
+            } else {
+                if (held_ms > 0 && strip_active) {
+                    led_strip_set_factory_reset(false);
+                }
+                held_ms = 0;
+            }
+#endif
         }
     }
 }
@@ -903,11 +946,27 @@ void app_main(void)
     if (web_disabled == NULL) {
         web_disabled = param_set_default("0");
     }
-    if (strcmp(web_disabled, "0") ==0) {
-        int web_port_setting = 80;
-        get_config_param_int("web_port", &web_port_setting);
+    int web_port_setting = 80;
+    get_config_param_int("web_port", &web_port_setting);
+    if (strcmp(web_disabled, "0") == 0) {
         ESP_LOGI(TAG,"Starting web server on port %d", web_port_setting);
         start_webserver((uint16_t)web_port_setting);
+    }
+
+    // mDNS responder: announce <hostname>.local on the LAN
+    if (hostname && hostname[0]) {
+        esp_err_t merr = mdns_init();
+        if (merr == ESP_OK) {
+            mdns_hostname_set(hostname);
+            mdns_instance_name_set(hostname);
+            if (strcmp(web_disabled, "0") == 0) {
+                mdns_service_add(NULL, "_http", "_tcp",
+                                 (uint16_t)web_port_setting, NULL, 0);
+            }
+            ESP_LOGI(TAG, "mDNS responder up: %s.local", hostname);
+        } else {
+            ESP_LOGW(TAG, "mdns_init failed: %s", esp_err_to_name(merr));
+        }
     }
     free(web_disabled);
 
@@ -927,6 +986,10 @@ void app_main(void)
     esp_console_register_help_command();
     register_system();
     register_router();
+
+#ifdef CONFIG_MQTT_HOMEASSISTANT
+    mqtt_ha_init();
+#endif
 
     /* Prompt to be printed before each line.
      * This can be customized, made dynamic, etc.

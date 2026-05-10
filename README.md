@@ -10,7 +10,7 @@ The board connects to an existing WiFi network as a client (STA) and shares that
 
 All traffic from Ethernet clients is NATed through the router's WiFi uplink address by default, so the upstream network sees only a single client. NAT can be disabled for routed (non-NATed) operation if the upstream network knows the `192.168.4.0/24` subnet. A WireGuard VPN tunnel can optionally replace or supplement the direct uplink path, with a kill switch that blocks unprotected traffic when the tunnel is down.
 
-All settings are managed through a browser-based web interface (accessible at `http://192.168.4.1` from the Ethernet LAN or via WiFi) or via the serial console at 115200 bps.
+All settings are managed through a browser-based web interface or via the serial console at 115200 bps. After boot the router is reachable by name at `http://esp32-eth-router.local` (or whatever hostname is configured) from any LAN client that supports mDNS — no need to look up the IP.
 
 ---
 
@@ -43,6 +43,9 @@ All settings are managed through a browser-based web interface (accessible at `h
 - OTA firmware update through the web interface
 - Byte counters for the WiFi uplink
 - Configurable TTL override, WiFi TX power, and timezone
+- mDNS responder — router reachable as `<hostname>.local` from any LAN client
+- MQTT / Home Assistant integration — publish telemetry and WoL buttons to HA (opt-in, ~58 KB flash)
+- Boot-button factory reset — hold the BOOT button (GPIO9) for 5 s to erase all settings (C3 SuperMini only)
 - All settings persisted in NVS flash; survive firmware updates
 
 ---
@@ -131,6 +134,7 @@ idf.py -B build_w5500_c3 -p /dev/ttyUSB0 flash monitor   # DevKit-M-1 (UART)
 - The W5500 module has no factory MAC address. The firmware derives one automatically from the ESP32-C3's base MAC.
 - The onboard LED on the SuperMini (typically GPIO 8) can be configured via `set_led_gpio 8`.
 - SPI clock defaults to 25 MHz. Increase via `set_spi_clock` if wiring is short and clean; decrease if you see SPI errors (`show status` shows SPI error counters).
+- **Boot-button factory reset:** Hold the **BOOT button (GPIO9)** for 5 seconds at any time to erase all NVS settings and reboot. The LED blinks rapidly and the LED strip (if configured) turns red during the countdown. This is the recovery path if the router is misconfigured and neither serial nor the web interface is reachable. Not available on the WT32-ETH01 (GPIO0 is used by the Ethernet clock).
 
 ---
 
@@ -408,6 +412,76 @@ The default port is 514. The server address is resolved by DNS and re-resolved e
 
 ---
 
+## mDNS
+
+After boot the router announces itself on the LAN via mDNS (Bonjour). Clients that support mDNS — macOS, Linux with avahi, Windows 10+, iOS, Android — can reach the web interface and ping the router by name without knowing its IP address.
+
+The default hostname is `esp32-eth-router`, making the router reachable at:
+
+```
+http://esp32-eth-router.local
+```
+
+Change the hostname with:
+
+```
+set_hostname <name>
+```
+
+The mDNS `_http._tcp` service is registered automatically when the web interface is enabled, so clients can discover the router with a service browser as well.
+
+---
+
+## MQTT / Home Assistant
+
+The router can publish telemetry to an MQTT broker with Home Assistant auto-discovery. When enabled, HA automatically creates a device with the following entities:
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| Uplink Status | binary_sensor | WiFi uplink connected / disconnected |
+| Connected Clients | sensor | Number of DHCP clients |
+| Bytes Sent / Received | sensor | Cumulative bytes through the WiFi uplink |
+| Free Heap | sensor | Available heap memory |
+| Uptime | sensor | Seconds since boot |
+| Uplink RSSI | sensor | WiFi signal strength |
+| Uplink SSID | sensor | Connected upstream network name |
+| Restart | button | Reboot the router |
+| Web UI | switch | Enable / disable the web interface |
+| Remote Console | switch | Enable / disable the TCP console |
+| Wake \<name\> | button | One per named DHCP reservation — sends a WoL magic packet |
+
+The WoL buttons let you wake any device whose MAC address is in the DHCP reservation list, directly from the HA dashboard or automations.
+
+### Enable
+
+MQTT is **disabled by default** (saves ~58 KB flash, important on the C3). Enable it in menuconfig:
+
+```bash
+idf.py -B build_w5500_c3 menuconfig   # MQTT Home Assistant → Enable
+```
+
+Then build and flash.
+
+### Configure (CLI)
+
+```
+mqtt broker <uri>            # e.g. mqtt://192.168.1.2 or mqtt://user:pass@host
+mqtt user <username> <pass>  # optional: set credentials separately
+mqtt interval <seconds>      # publish interval, 5–3600 (default 30)
+mqtt enable                  # connect to broker and start publishing
+mqtt disable                 # disconnect
+mqtt status                  # show connection state and settings
+mqtt rediscover              # re-publish HA discovery configs (e.g. after adding a reservation)
+```
+
+Settings are persisted in NVS. The broker URI and credentials are stored under keys `mqtt_uri`, `mqtt_user`, `mqtt_pass`.
+
+### WoL buttons
+
+Each DHCP reservation that has a name (`dhcp_reserve add <mac> <ip> -n <name>`) gets a corresponding `button` entity in HA. Pressing it sends a WoL magic packet to that MAC address via the Ethernet downlink. Add or remove reservations and run `mqtt rediscover` to update HA.
+
+---
+
 ## CLI Reference
 
 Connect via serial at 115200 bps, or via the remote console.
@@ -501,6 +575,18 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 | `syslog enable <server> [<port>]` | Enable syslog forwarding |
 | `syslog disable` | Disable syslog forwarding |
 | `syslog status` | Show syslog configuration |
+
+### MQTT / Home Assistant
+
+| Command | Description |
+|---------|-------------|
+| `mqtt status` | Show MQTT status and broker settings |
+| `mqtt enable` | Connect to broker and start publishing |
+| `mqtt disable` | Disconnect and stop publishing |
+| `mqtt broker <uri>` | Set broker URI (e.g. `mqtt://192.168.1.2`) |
+| `mqtt user <user> <pass>` | Set broker credentials |
+| `mqtt interval <seconds>` | Set publish interval (5–3600 s, default 30) |
+| `mqtt rediscover` | Re-publish HA discovery configs |
 
 ### Web Interface
 
@@ -630,7 +716,7 @@ After flashing either variant, connect via serial at 115200 bps and configure th
 set_sta MyWiFiSSID MyPassword
 ```
 
-The router will reboot and connect. Access the web interface at `http://192.168.4.1` from a device connected to the Ethernet port.
+The router will reboot and connect. Access the web interface at `http://192.168.4.1` (or `http://esp32-eth-router.local` via mDNS) from a device connected to the Ethernet port.
 
 To erase all settings and return to defaults:
 
