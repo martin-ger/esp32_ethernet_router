@@ -930,11 +930,10 @@ static esp_err_t index_get_handler(httpd_req_t *req)
     }
 
     /* Stream Bytes row */
-    uint64_t bytes_sent = get_sta_bytes_sent();
-    uint64_t bytes_received = get_sta_bytes_received();
-    float sent_mb = bytes_sent / (1024.0 * 1024.0);
-    float received_mb = bytes_received / (1024.0 * 1024.0);
-    snprintf(row, sizeof(row), "<tr><td>Bytes:</td><td>%.1f MB sent / %.1f MB received</td></tr>", sent_mb, received_mb);
+    char sent_str[16], recv_str[16];
+    format_bytes_human(get_sta_bytes_sent(), sent_str, sizeof(sent_str));
+    format_bytes_human(get_sta_bytes_received(), recv_str, sizeof(recv_str));
+    snprintf(row, sizeof(row), "<tr><td>Bytes:</td><td>%s sent / %s received</td></tr>", sent_str, recv_str);
     httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
 
     /* Stream Uptime row */

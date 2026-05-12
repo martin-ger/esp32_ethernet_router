@@ -1291,7 +1291,10 @@ static int show(int argc, char **argv)
         printf("Ethernet: %s\n", eth_link_up ? "link up" : "link down");
 
         // Byte counts
-        printf("Bytes sent/received: %" PRIu64 " / %" PRIu64 " bytes\n", get_sta_bytes_sent(), get_sta_bytes_received());
+        char sent_str[16], recv_str[16];
+        format_bytes_human(get_sta_bytes_sent(), sent_str, sizeof(sent_str));
+        format_bytes_human(get_sta_bytes_received(), recv_str, sizeof(recv_str));
+        printf("Bytes sent/received: %s / %s\n", sent_str, recv_str);
 
         // Free heap
         printf("Free heap: %lu bytes\n", (unsigned long)esp_get_free_heap_size());
