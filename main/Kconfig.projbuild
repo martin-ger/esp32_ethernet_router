@@ -116,3 +116,14 @@ menu "MQTT Home Assistant"
         depends on MQTT_HOMEASSISTANT
 
 endmenu
+
+menu "mDNS"
+
+    config MDNS_ENABLED
+        bool "Enable mDNS responder"
+        default y
+        help
+            Announces <hostname>.local on the LAN via mDNS. Disabling
+            saves ~4 KB heap and one task stack on the ESP32-C3.
+
+endmenu

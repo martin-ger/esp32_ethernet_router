@@ -81,3 +81,10 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
 
+# --- Additional heap savings for single-core C3 ---
+# Disable mDNS responder (saves ~4 KB heap + task stack)
+# CONFIG_MDNS_ENABLED is not set
+
+# Limit lwIP sockets to reduce per-socket control block overhead
+CONFIG_LWIP_MAX_SOCKETS=8
+

@@ -36,6 +36,9 @@
 #include "mbedtls/sha256.h"
 #include "esp_random.h"
 
+#if SOC_TEMP_SENSOR_SUPPORTED
+#include "driver/temperature_sensor.h"
+#endif
 #include "driver/gpio.h"
 #include "router_globals.h"
 #include "dhcp_reservations.h"
@@ -1295,6 +1298,24 @@ static int show(int argc, char **argv)
         format_bytes_human(get_sta_bytes_sent(), sent_str, sizeof(sent_str));
         format_bytes_human(get_sta_bytes_received(), recv_str, sizeof(recv_str));
         printf("Bytes sent/received: %s / %s\n", sent_str, recv_str);
+
+#if SOC_TEMP_SENSOR_SUPPORTED
+        // CPU temperature
+        {
+            temperature_sensor_handle_t tsens;
+            temperature_sensor_config_t tsens_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
+            //temperature_sensor_config_t tsens_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+            if (temperature_sensor_install(&tsens_cfg, &tsens) == ESP_OK) {
+                float celsius = 0.0f;
+                temperature_sensor_enable(tsens);
+                if (temperature_sensor_get_celsius(tsens, &celsius) == ESP_OK) {
+                    printf("CPU temperature: %.1f °C\n", celsius);
+                }
+                temperature_sensor_disable(tsens);
+                temperature_sensor_uninstall(tsens);
+            }
+        }
+#endif
 
         // Free heap
         printf("Free heap: %lu bytes\n", (unsigned long)esp_get_free_heap_size());

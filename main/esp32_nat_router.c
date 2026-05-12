@@ -70,7 +70,9 @@
 #include "remote_console.h"
 #include "syslog_client.h"
 #include "led_strip_status.h"
+#ifdef CONFIG_MDNS_ENABLED
 #include "mdns.h"
+#endif
 #ifdef CONFIG_MQTT_HOMEASSISTANT
 #include "mqtt_ha.h"
 #endif
@@ -954,6 +956,7 @@ void app_main(void)
     }
 
     // mDNS responder: announce <hostname>.local on the LAN
+#ifdef CONFIG_MDNS_ENABLED
     if (hostname && hostname[0]) {
         esp_err_t merr = mdns_init();
         if (merr == ESP_OK) {
@@ -968,6 +971,7 @@ void app_main(void)
             ESP_LOGW(TAG, "mdns_init failed: %s", esp_err_to_name(merr));
         }
     }
+#endif
     free(web_disabled);
 
     // Initialize PCAP capture (TCP server on port 19000)
