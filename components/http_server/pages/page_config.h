@@ -85,7 +85,7 @@ setTimeout(\"location.href = '/'\", 10000);\
 <form action='' method='GET'>\
 <table>\
 <tr><td>SSID</td><td><input type='text' name='ssid' value='%s' placeholder='Uplink network'/></td></tr>\
-<tr><td>Password</td><td><input type='text' name='password' placeholder='unchanged'/></td></tr>\
+<tr><td>Password</td><td><input type='password' name='password' placeholder='unchanged'/></td></tr>\
 <tr><td colspan='2' style='padding-top: 1rem; color: #888; font-size: 0.85rem;'>WPA2 Enterprise (optional)</td></tr>\
 <tr><td>Username</td><td><input type='text' name='ent_username' value='%s' placeholder='Enterprise username'/></td></tr>\
 <tr><td>Identity</td><td><input type='text' name='ent_identity' value='%s' placeholder='Optional (defaults to username)'/></td></tr>\
