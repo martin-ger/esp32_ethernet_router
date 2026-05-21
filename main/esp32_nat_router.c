@@ -605,6 +605,12 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
         ipInfo_sta.netmask.addr = esp_ip4addr_aton(subnet_mask);
         esp_netif_dhcpc_stop(wifiSTA); // Don't run a DHCP client
         esp_netif_set_ip_info(wifiSTA, &ipInfo_sta);
+        // No DHCP → set DNS explicitly; DHCP path gets DNS from the upstream AP
+        esp_netif_dns_info_t static_dns = {};
+        const char *dns_str = (ap_dns && ap_dns[0]) ? ap_dns : DEFAULT_DNS;
+        static_dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(dns_str);
+        static_dns.ip.type = ESP_IPADDR_TYPE_V4;
+        esp_netif_set_dns_info(wifiSTA, ESP_NETIF_DNS_MAIN, &static_dns);
         apply_portmap_tab();
     }
 
