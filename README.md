@@ -198,6 +198,7 @@ set_sta_static <ip> <subnet> <gateway>
 set_sta_static dhcp
 set_sta_mac <AA:BB:CC:DD:EE:FF>
 set_tx_power <dBm>
+set_wifi_country <CC>
 ```
 
 The router connects to the upstream WiFi network and reconnects immediately on disconnect. WPA2-Enterprise (PEAP/TTLS/TLS) can be configured in the web interface.
@@ -617,6 +618,7 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 | `set_led_gpio <gpio\|none>` | Set GPIO for status LED |
 | `set_led_lowactive <true\|false>` | Invert LED polarity (active-low LEDs) |
 | `set_tx_power <dBm>` | Set WiFi transmit power |
+| `set_wifi_country <CC>` | Set WiFi regulatory country code (2-char ISO 3166, e.g. `US`, `DE`; `01` = world-safe default) |
 | `set_spi_clock <MHz>` | Set W5500 SPI clock speed in MHz (1-80, requires reboot) — W5500 only |
 | `w5500 <status\|reset>` | Shows W5500 chip status and can reset it |
 | `set_tz <TZ string>` | Set POSIX timezone |

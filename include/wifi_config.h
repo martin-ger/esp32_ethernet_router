@@ -33,6 +33,9 @@ extern bool wifi_scan_active;
 extern uint32_t my_ip;
 extern uint32_t my_ap_ip;
 
+// WiFi regulatory country code (2-char + NUL, e.g. "US", "DE", "01" = world-safe)
+extern char wifi_country_code[3];
+
 // WPA2-Enterprise settings
 extern int32_t eap_method;          // 0=Auto, 1=PEAP, 2=TTLS, 3=TLS
 extern int32_t ttls_phase2;         // 0=MSCHAPv2, 1=MSCHAP, 2=PAP, 3=CHAP
