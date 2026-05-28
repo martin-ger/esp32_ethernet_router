@@ -123,6 +123,7 @@ static struct sockaddr_in s_dest_addr;
 
 static uint32_t    s_seq        = 0;
 static uint32_t    s_exported   = 0;    /* total flows exported since boot */
+static TaskHandle_t s_export_task = NULL;
 
 /* ── FNV-1a hash ────────────────────────────────────────────────────────────── */
 
@@ -438,7 +439,9 @@ esp_err_t netflow_init(void)
         }
     }
 
-    xTaskCreate(export_task, "netflow_exp", 3072, NULL, 4, NULL);
+    if (atomic_load(&s_directions) && s_collector_ip[0] != '\0') {
+        xTaskCreate(export_task, "netflow_exp", 5120, NULL, 4, &s_export_task);
+    }
     ESP_LOGI(TAG, "initialized (table=%d, directions=0x%02x)", NF_TABLE_SIZE,
              (int)atomic_load(&s_directions));
     return ESP_OK;
@@ -485,6 +488,9 @@ esp_err_t netflow_enable(const char *collector_ip, uint16_t port, uint8_t direct
 
     esp_err_t err = open_socket();
     if (err == ESP_OK) {
+        if (s_export_task == NULL) {
+            xTaskCreate(export_task, "netflow_exp", 5120, NULL, 4, &s_export_task);
+        }
         ESP_LOGI(TAG, "enabled → %s:%u (dir=0x%02x)", s_collector_ip, s_port, directions);
     }
     return err;
@@ -504,6 +510,11 @@ esp_err_t netflow_disable(void)
 {
     atomic_store(&s_directions, 0);
     close_socket();
+
+    if (s_export_task != NULL) {
+        vTaskDelete(s_export_task);
+        s_export_task = NULL;
+    }
 
     /* Free flow table to return RAM to the heap */
     xSemaphoreTake(s_mutex, portMAX_DELAY);

@@ -99,5 +99,8 @@ small { display: block; color: #888; font-size: 0.85rem; margin-top: 0.5rem; lin
 
 /* Closing HTML - closes #container */
 #define MONITORING_CHUNK_TAIL "\
+<div style='margin-top: 2rem; text-align: center;'>\
+<a href='/' style='padding: 0.75rem 2rem; background: linear-gradient(135deg, #43a047 0%, #2e7d32 100%); color: #fff; border: none; border-radius: 8px; text-decoration: none; font-size: 0.95rem; font-weight: 600;'>&#127968; Home</a>\
+</div>\
 </div>\
 </body></html>"
