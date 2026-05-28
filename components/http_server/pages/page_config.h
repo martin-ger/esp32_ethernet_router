@@ -146,26 +146,6 @@ setTimeout(\"location.href = '/'\", 10000);\
 </form>"
 
 /* PCAP section - uses: pcap_off/acl/promisc_sel, pcap_color, pcap_status, captured, dropped, snaplen, sta_ip */
-#define CONFIG_CHUNK_PCAP "\
-<h2>PCAP Packet Capture</h2>\
-<form action='' method='GET'>\
-<input type='hidden' name='pcap_save' value='1'/>\
-<table>\
-<tr><td>Mode</td><td>\
-<select name='pcap_mode'>\
-<option value='off' %s>Off</option>\
-<option value='acl' %s>ACL Monitor</option>\
-<option value='promisc' %s>Promiscuous</option>\
-</select>\
-</td></tr>\
-<tr><td>Client</td><td><strong style='color: %s;'>%s</strong></td></tr>\
-<tr><td>Stats</td><td>%lu captured, %lu dropped</td></tr>\
-<tr><td>Snaplen</td><td><input type='text' name='pcap_snaplen' value='%d' placeholder='64-1600'/></td></tr>\
-<tr><td></td><td><input type='submit' value='Save' class='ok-button'/></td></tr>\
-</table>\
-<small>Connect using: nc %s 19000 | wireshark -k -i -</small>\
-</form>"
-
 /* Device management and footer */
 #define CONFIG_CHUNK_TAIL "\
 <h2>Device Management</h2>\

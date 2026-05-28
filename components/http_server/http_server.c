@@ -38,8 +38,10 @@
 #include "router_globals.h"
 #include "cmd_router.h"
 #include "pcap_capture.h"
+#include "netflow.h"
 #include "acl.h"
 #include "remote_console.h"
+#include "syslog_client.h"
 #include "cJSON.h"
 #include "esp_ota_ops.h"
 #include "esp_app_format.h"
@@ -1339,32 +1341,6 @@ static esp_err_t config_get_handler(httpd_req_t *req)
                 return ESP_OK;
             }
 
-            /* Handle PCAP settings (single form) */
-            if (httpd_query_key_value(buf, "pcap_save", param1, sizeof(param1)) == ESP_OK) {
-                if (httpd_query_key_value(buf, "pcap_mode", param1, sizeof(param1)) == ESP_OK) {
-                    preprocess_string(param1);
-                    if (strcmp(param1, "off") == 0) {
-                        pcap_set_mode(PCAP_MODE_OFF);
-                    } else if (strcmp(param1, "acl") == 0) {
-                        pcap_set_mode(PCAP_MODE_ACL_MONITOR);
-                    } else if (strcmp(param1, "promisc") == 0) {
-                        pcap_set_mode(PCAP_MODE_PROMISCUOUS);
-                    }
-                }
-                if (httpd_query_key_value(buf, "pcap_snaplen", param1, sizeof(param1)) == ESP_OK) {
-                    preprocess_string(param1);
-                    int snaplen = atoi(param1);
-                    if (snaplen >= 64 && snaplen <= 1600) {
-                        pcap_set_snaplen((uint16_t)snaplen);
-                    }
-                }
-                ESP_LOGI(TAG, "PCAP settings saved via web");
-                free(buf);
-                httpd_resp_set_status(req, "303 See Other");
-                httpd_resp_set_hdr(req, "Location", "/config");
-                httpd_resp_send(req, NULL, 0);
-                return ESP_OK;
-            }
         }
         free(buf);
     }
@@ -1463,18 +1439,6 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     const char* rc_sta_chk = (rc_config.bind & RC_BIND_STA) ? "checked" : "";
     const char* rc_vpn_chk = (rc_config.bind & RC_BIND_VPN) ? "checked" : "";
 
-    // PCAP state
-    pcap_capture_mode_t pcap_mode = pcap_get_mode();
-    const char* pcap_mode_off_sel = (pcap_mode == PCAP_MODE_OFF) ? "selected" : "";
-    const char* pcap_mode_acl_sel = (pcap_mode == PCAP_MODE_ACL_MONITOR) ? "selected" : "";
-    const char* pcap_mode_promisc_sel = (pcap_mode == PCAP_MODE_PROMISCUOUS) ? "selected" : "";
-    bool pcap_client = pcap_client_connected();
-    const char* pcap_client_color = pcap_client ? "#4caf50" : "#888";
-    const char* pcap_client_text = pcap_client ? "Connected" : "Not connected";
-    uint32_t pcap_captured = pcap_get_captured_count();
-    uint32_t pcap_dropped = pcap_get_dropped_count();
-    int current_snaplen = pcap_get_snaplen();
-
     /* Reusable buffer for building sections */
     char section[2048];
 
@@ -1528,21 +1492,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         (unsigned long)rc_config.idle_timeout_sec);
     httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
 
-    /* Chunk 8: PCAP */
-    char sta_ip_str[16];
-    {
-        ip4_addr_t sta_addr;
-        sta_addr.addr = my_ip;
-        snprintf(sta_ip_str, sizeof(sta_ip_str), IPSTR, IP2STR(&sta_addr));
-    }
-    snprintf(section, sizeof(section), CONFIG_CHUNK_PCAP,
-        pcap_mode_off_sel, pcap_mode_acl_sel, pcap_mode_promisc_sel,
-        pcap_client_color, pcap_client_text,
-        (unsigned long)pcap_captured, (unsigned long)pcap_dropped,
-        current_snaplen, sta_ip_str);
-    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
-
-    /* Chunk 9: Device management heading */
+    /* Chunk 8: Device management heading */
     httpd_resp_send_chunk(req, CONFIG_CHUNK_TAIL, HTTPD_RESP_USE_STRLEN);
 
     /* Chunk 9a: Dynamic OTA info (running partition, version) */
@@ -2820,6 +2770,197 @@ static httpd_uri_t vpnp = {
     .handler   = vpn_get_handler,
 };
 
+/* ── /monitoring handler ──────────────────────────────────────────────────── */
+
+static esp_err_t monitoring_get_handler(httpd_req_t *req)
+{
+    bool password_protection_enabled = is_web_password_set();
+    if (password_protection_enabled && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /monitoring from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/?auth_required=1");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    char *buf;
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = malloc(buf_len);
+        if (buf == NULL) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            return ESP_ERR_NO_MEM;
+        }
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            char param1[128];
+
+            /* Handle PCAP settings */
+            if (httpd_query_key_value(buf, "pcap_save", param1, sizeof(param1)) == ESP_OK) {
+                if (httpd_query_key_value(buf, "pcap_mode", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    if (strcmp(param1, "off") == 0)         pcap_set_mode(PCAP_MODE_OFF);
+                    else if (strcmp(param1, "acl") == 0)    pcap_set_mode(PCAP_MODE_ACL_MONITOR);
+                    else if (strcmp(param1, "promisc") == 0) pcap_set_mode(PCAP_MODE_PROMISCUOUS);
+                }
+                if (httpd_query_key_value(buf, "pcap_snaplen", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    int snaplen = atoi(param1);
+                    if (snaplen >= 64 && snaplen <= 1600) pcap_set_snaplen((uint16_t)snaplen);
+                }
+                ESP_LOGI(TAG, "PCAP settings saved via web");
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/monitoring");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
+
+            /* Handle NetFlow settings */
+            if (httpd_query_key_value(buf, "nf_save", param1, sizeof(param1)) == ESP_OK) {
+                char nf_ip[16] = "";
+                uint8_t nf_dirs = 0;
+                if (httpd_query_key_value(buf, "nf_ingress", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    if (strcmp(param1, "1") == 0) nf_dirs |= NF_DIR_INGRESS;
+                }
+                if (httpd_query_key_value(buf, "nf_egress", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    if (strcmp(param1, "1") == 0) nf_dirs |= NF_DIR_EGRESS;
+                }
+                if (httpd_query_key_value(buf, "nf_collector", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    strlcpy(nf_ip, param1, sizeof(nf_ip));
+                }
+                uint16_t nf_port = 0;
+                if (httpd_query_key_value(buf, "nf_port", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    int p = atoi(param1);
+                    if (p >= 1 && p <= 65535) nf_port = (uint16_t)p;
+                }
+                if (httpd_query_key_value(buf, "nf_idle_to", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    int s = atoi(param1);
+                    if (s > 0) netflow_set_timeouts((uint32_t)s, 0);
+                }
+                if (httpd_query_key_value(buf, "nf_active_to", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    int s = atoi(param1);
+                    if (s > 0) netflow_set_timeouts(0, (uint32_t)s);
+                }
+                if (nf_dirs != 0 && nf_ip[0] != '\0') netflow_enable(nf_ip, nf_port, nf_dirs);
+                else netflow_disable();
+                ESP_LOGI(TAG, "NetFlow settings saved via web");
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/monitoring");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
+
+            /* Handle Syslog settings */
+            if (httpd_query_key_value(buf, "syslog_save", param1, sizeof(param1)) == ESP_OK) {
+                char sl_server[SYSLOG_MAX_SERVER_LEN] = "";
+                uint16_t sl_port = SYSLOG_DEFAULT_PORT;
+                if (httpd_query_key_value(buf, "syslog_server", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    strlcpy(sl_server, param1, sizeof(sl_server));
+                }
+                if (httpd_query_key_value(buf, "syslog_port", param1, sizeof(param1)) == ESP_OK) {
+                    preprocess_string(param1);
+                    int p = atoi(param1);
+                    if (p >= 1 && p <= 65535) sl_port = (uint16_t)p;
+                }
+                if (sl_server[0] != '\0') syslog_enable(sl_server, sl_port);
+                else syslog_disable();
+                ESP_LOGI(TAG, "Syslog settings saved via web");
+                free(buf);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/monitoring");
+                httpd_resp_send(req, NULL, 0);
+                return ESP_OK;
+            }
+        }
+        free(buf);
+    }
+
+    /* Gather PCAP state */
+    pcap_capture_mode_t pcap_mode = pcap_get_mode();
+    const char *pcap_mode_off_sel     = (pcap_mode == PCAP_MODE_OFF)           ? "selected" : "";
+    const char *pcap_mode_acl_sel     = (pcap_mode == PCAP_MODE_ACL_MONITOR)   ? "selected" : "";
+    const char *pcap_mode_promisc_sel = (pcap_mode == PCAP_MODE_PROMISCUOUS)   ? "selected" : "";
+    bool pcap_client = pcap_client_connected();
+    const char *pcap_client_color = pcap_client ? "#4caf50" : "#888";
+    const char *pcap_client_text  = pcap_client ? "Connected" : "Not connected";
+    char sta_ip_str[16];
+    { ip4_addr_t a; a.addr = my_ip; snprintf(sta_ip_str, sizeof(sta_ip_str), IPSTR, IP2STR(&a)); }
+
+    /* Gather NetFlow state */
+    bool nf_en;
+    char nf_ip[16];
+    uint16_t nf_port;
+    uint32_t nf_idle_s, nf_active_s;
+    uint8_t nf_dirs;
+    netflow_get_config(&nf_en, nf_ip, sizeof(nf_ip), &nf_port, &nf_idle_s, &nf_active_s, &nf_dirs);
+
+    /* Gather Syslog state */
+    bool sl_en;
+    char sl_server[SYSLOG_MAX_SERVER_LEN] = "";
+    uint16_t sl_port;
+    syslog_get_config(&sl_en, sl_server, sizeof(sl_server), &sl_port);
+
+    char section[2048];
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    /* Head */
+    httpd_resp_send_chunk(req, MONITORING_CHUNK_HEAD, HTTPD_RESP_USE_STRLEN);
+
+    /* Logout button (if authenticated) */
+    if (session_active && password_protection_enabled) {
+        httpd_resp_send_chunk(req,
+            "<a href='/?logout=1' style='padding: 0.4rem 1rem; background: rgba(255,82,82,0.15); color: #ff5252; border: 1px solid #ff5252; border-radius: 6px; text-decoration: none; font-size: 0.85rem; font-weight: 500;'>Logout</a>",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Close flex header div */
+    httpd_resp_send_chunk(req, "</div>", HTTPD_RESP_USE_STRLEN);
+
+    /* PCAP section */
+    snprintf(section, sizeof(section), MONITORING_CHUNK_PCAP,
+        pcap_mode_off_sel, pcap_mode_acl_sel, pcap_mode_promisc_sel,
+        pcap_client_color, pcap_client_text,
+        (unsigned long)pcap_get_captured_count(), (unsigned long)pcap_get_dropped_count(),
+        pcap_get_snaplen(), sta_ip_str);
+    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* NetFlow section */
+    snprintf(section, sizeof(section), MONITORING_CHUNK_NETFLOW,
+        (nf_dirs & NF_DIR_INGRESS) ? "checked" : "",
+        (nf_dirs & NF_DIR_EGRESS)  ? "checked" : "",
+        nf_ip, nf_port,
+        (unsigned long)nf_idle_s, (unsigned long)nf_active_s,
+        (unsigned long)netflow_get_active_flows(),
+        (unsigned long)netflow_get_exported_flows());
+    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    /* Syslog section */
+    snprintf(section, sizeof(section), MONITORING_CHUNK_SYSLOG,
+        sl_en ? "#4caf50" : "#888",
+        sl_en ? "Enabled" : "Disabled",
+        sl_server, sl_port);
+    httpd_resp_send_chunk(req, section, HTTPD_RESP_USE_STRLEN);
+
+    httpd_resp_send_chunk(req, MONITORING_CHUNK_TAIL, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static httpd_uri_t monitoringp = {
+    .uri     = "/monitoring",
+    .method  = HTTP_GET,
+    .handler = monitoring_get_handler,
+};
+
 static esp_err_t captive_redirect_handler(httpd_req_t *req, httpd_err_code_t err);
 
 httpd_handle_t start_webserver(uint16_t port)
@@ -2828,7 +2969,7 @@ httpd_handle_t start_webserver(uint16_t port)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.stack_size = 16384;  // Large stack needed for mappings page with 3x 2KB HTML buffers
-    config.max_uri_handlers = 13;
+    config.max_uri_handlers = 14;
     config.max_uri_len = 1024;
     config.open_fn = http_open_fn;
 
@@ -2853,6 +2994,7 @@ httpd_handle_t start_webserver(uint16_t port)
         httpd_register_uri_handler(server, &firewallp);
         httpd_register_uri_handler(server, &scanp);
         httpd_register_uri_handler(server, &vpnp);
+        httpd_register_uri_handler(server, &monitoringp);
         /* setup page removed — config page handles all settings */
         httpd_register_uri_handler(server, &favicon_uri);
         httpd_register_uri_handler(server, &config_exportp);

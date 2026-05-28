@@ -72,10 +72,11 @@ include/
 components/
 ├── acl/                 # Stateless packet filtering firewall (4 ACL lists, 16 rules each)
 ├── dhcpserver/          # Custom DHCP server with reservation support (overrides ESP-IDF built-in)
-├── http_server/         # Web UI server (pages: /, /config, /mappings, /firewall, /vpn, /scan)
+├── http_server/         # Web UI server (pages: /, /config, /monitoring, /mappings, /firewall, /vpn, /scan)
+├── netflow/             # NetFlow v5 exporter: flow table, UDP export, ingress/egress direction bitmask
 ├── pcap_capture/        # PCAP packet capture with TCP streaming to Wireshark
 ├── remote_console/      # Network-accessible CLI via TCP (password protected)
-├── cmd_router/          # CLI commands: set_sta, set_ap_ip, set_ap_dns, set_eth_nat, set_eth_dhcps, portmap, dhcp_reserve, web_ui, set_router_password, show, acl, remote_console, syslog
+├── cmd_router/          # CLI commands: set_sta, set_ap_ip, set_ap_dns, set_eth_nat, set_eth_dhcps, portmap, dhcp_reserve, web_ui, set_router_password, show, acl, remote_console, syslog, netflow
 └── cmd_system/          # System commands: free, heap, restart, factory_reset, tasks
 ```
 
@@ -279,11 +280,36 @@ remote_console timeout <sec>  # Set idle timeout
 remote_console kick           # Disconnect session
 ```
 
+### NetFlow Component
+The `components/netflow/` directory implements a NetFlow v5 UDP exporter.
+
+**Direction bitmask** (`netflow.h`):
+```c
+#define NF_DIR_INGRESS 0x01  // ETH client → router (pre-NAT source IPs)
+#define NF_DIR_EGRESS  0x02  // router → ETH client
+```
+
+**Key API** (`netflow.h`):
+- `netflow_enable(collector_ip, port, directions)` - Allocate table, open UDP socket, start export task
+- `netflow_set_directions(directions)` - Change direction bitmask without resetting table or socket
+- `netflow_disable()` - Free table, close socket
+- `netflow_account(pbuf, dir)` - Hot-path: account packet into flow table (called from `netif_hooks.c`)
+- `netflow_get_config(..., directions_out)` - Read all config including direction bitmask
+
+**Hook integration** (`main/netif_hooks.c`):
+- `dl_netif_input_hook`: calls `netflow_account(p, NF_DIR_INGRESS)`
+- `dl_netif_linkoutput_hook`: calls `netflow_account(p, NF_DIR_EGRESS)`
+
+**NVS key:** `nf_dir` (i32 bitmask, 0=disabled). Migrates from legacy `nf_en` (i32 bool) on first boot with new firmware.
+
+**Table size:** 256 entries on ESP32, 128 on ESP32-C3. Linear-probe hash, FNV-1a. Export task runs every 5 s.
+
 ### Configuration Storage
 All settings persist in NVS (Non-Volatile Storage) under namespace `esp32_nat`:
 - WiFi STA credentials, static IP settings, port mappings, DHCP reservations
 - Web interface password (`web_password` key) and disable state (`lock` key)
 - ETH NAT state (`eth_nat` key), ETH DHCP server state (`eth_dhcps` key)
+- NetFlow direction bitmask (`nf_dir` key), collector (`nf_collector`), port (`nf_port`), timeouts (`nf_idle_to`, `nf_active_to`)
 - Survives firmware updates (use `esptool.py erase_flash` for factory reset)
 
 ### Critical SDK Configuration
@@ -324,6 +350,12 @@ acl clear <list>                                 # Clear all rules from ACL list
 remote_console status                            # Show remote console status
 remote_console enable                            # Enable remote console (requires web_password)
 remote_console disable                           # Disable remote console
+netflow enable <ip> [<port>] [ingress|egress|both]  # Enable NetFlow exporter (default port 2055, direction ingress)
+netflow disable                                  # Disable NetFlow exporter
+netflow direction <ingress|egress|both>          # Change capture direction while enabled
+netflow collector <ip> [<port>]                  # Change collector without full disable/enable
+netflow status                                   # Show configuration and statistics
+netflow show                                     # Print active flow table
 ```
 
 **Removed commands** (not applicable to this variant):
@@ -335,7 +367,8 @@ Access at the Ethernet downlink IP (default `http://192.168.4.1`) from a device 
 
 **Pages:**
 - `/` - System status (Uplink SSID, Uplink IP, Uplink Signal, Ethernet IP, VPN Status, Monitoring, Bytes, Uptime)
-- `/config` - Router configuration (WiFi uplink settings, Ethernet subnet settings incl. NAT+DHCP toggles) - protected
+- `/config` - Router configuration (WiFi uplink settings, Ethernet subnet settings incl. NAT+DHCP toggles, Remote Console, Device Management) - protected
+- `/monitoring` - Monitoring tools (PCAP capture, NetFlow v5 exporter, Syslog) - protected
 - `/mappings` - DHCP reservations and port forwarding - protected; sections shown conditionally:
   - "Connected Clients" and "DHCP Reservations" only shown when `eth_dhcps_enabled`
   - "Port Forwarding" only shown when `eth_nat_enabled`
@@ -347,7 +380,7 @@ Access at the Ethernet downlink IP (default `http://192.168.4.1`) from a device 
 - "Mappings" button on index page only shown when `eth_dhcps_enabled || eth_nat_enabled`
 
 **Password Protection:**
-- Optional password protects `/config`, `/mappings`, `/firewall`, `/vpn` pages
+- Optional password protects `/config`, `/monitoring`, `/mappings`, `/firewall`, `/vpn` pages
 - Login form shown on index page when password is set
 - Cookie-based sessions with 30-minute timeout
 - Set via web interface or `set_web_password` command
@@ -376,13 +409,13 @@ netif_input_hook(pbuf, netif)      // Counts sta_bytes_received
 netif_linkoutput_hook(netif, pbuf) // Counts sta_bytes_sent
 ```
 
-**ETH Interface Hooks (scaffolding for future use):**
+**ETH Downlink Hooks (active):**
 ```c
-static netif_input_fn original_ap_netif_input;
-static netif_linkoutput_fn original_ap_netif_linkoutput;
+static netif_input_fn original_dl_netif_input;
+static netif_linkoutput_fn original_dl_netif_linkoutput;
 
-ap_netif_input_hook(pbuf, netif)      // Currently pass-through
-ap_netif_linkoutput_hook(netif, pbuf) // Currently pass-through
+dl_netif_input_hook(pbuf, netif)      // ACL, VPN kill switch, PMTU, MSS clamp, per-client stats, NetFlow ingress, PCAP
+dl_netif_linkoutput_hook(netif, pbuf) // ACL, MSS clamp, per-client stats, NetFlow egress, PCAP
 ```
 
 **Public API** (`router_globals.h`):

@@ -40,6 +40,7 @@ All settings are managed through a browser-based web interface or via the serial
 - WireGuard VPN client with kill switch and split-tunnel / route-all modes
 - Remote console — password-protected TCP CLI on a configurable port
 - Syslog forwarding — ship ESP log output to a remote syslog server via UDP
+- NetFlow v5 exporter — export per-client flow records to any NetFlow collector (ntopng, nfdump, Grafana)
 - OTA firmware update through the web interface
 - Byte counters for the WiFi uplink
 - Configurable TTL override, WiFi TX power, and timezone
@@ -158,9 +159,16 @@ Grouped into sections. Changes trigger a reboot to apply.
 - *WiFi Settings (Uplink)* — SSID, password, WPA2-Enterprise credentials (username, identity, EAP method, TTLS phase 2, certificate options), MAC address override
 - *Static IP Settings* — static IP, subnet mask, gateway for the WiFi uplink; leave empty to use DHCP
 - *Remote Console* — enable/disable, port, interface binding (ETH/STA/VPN), idle timeout
-- *PCAP Packet Capture* — capture mode (off / ACL monitor / promiscuous), snaplen, live stats
 - *Device Management* — OTA firmware upload, factory reset
 - *Web UI Settings* — Access to the web UI
+
+**Monitoring**
+
+Monitoring and diagnostics tools, password-protected.
+
+- *PCAP Packet Capture* — capture mode (off / ACL monitor / promiscuous), snaplen, live stats
+- *NetFlow v5 Exporter* — ingress / egress direction checkboxes, collector IP and port, idle and active flow timeouts, live stats; leave collector empty to disable
+- *Syslog* — remote syslog server address and UDP port; leave server empty to disable
 
 **Mappings**
 
@@ -184,7 +192,7 @@ Scans for available upstream networks and displays SSID, BSSID, channel, RSSI, a
 
 ### Password Protection
 
-Set a password with `set_router_password <password>` or through the web interface. When set, the Configuration, Mappings, Firewall, and VPN pages require authentication. Sessions last 30 minutes. Clear the password by setting an empty string.
+Set a password with `set_router_password <password>` or through the web interface. When set, the Configuration, Mappings, Firewall, VPN, and Monitoring pages require authentication. Sessions last 30 minutes. Clear the password by setting an empty string.
 
 ---
 
@@ -339,7 +347,7 @@ Connect from a workstation on the LAN:
 nc 192.168.4.1 19000 | wireshark -k -i -
 ```
 
-The connection command is also shown in the PCAP section of the Configuration page. Snaplen limits the captured bytes per packet (64–1600, default 1600).
+The connection command is also shown in the PCAP section of the Monitoring page. Snaplen limits the captured bytes per packet (64–1600, default 1600).
 
 ---
 
@@ -410,6 +418,32 @@ syslog status
 ```
 
 The default port is 514. The server address is resolved by DNS and re-resolved each time the WiFi uplink connects. Configuration is persisted in NVS.
+
+---
+
+## NetFlow
+
+The router exports per-client flow records in **NetFlow v5** format to a UDP collector. Two capture directions are selectable independently:
+
+- **Ingress** — packets arriving from Ethernet clients. Because this is the pre-NAT path, the source IP is the real LAN client address (e.g. `192.168.4.x`), not the masqueraded ESP32 IP.
+- **Egress** — packets leaving toward Ethernet clients (post-NAT responses).
+
+Either or both directions can be enabled simultaneously. Each flow is a unidirectional 5-tuple (src IP, dst IP, protocol, src port, dst port). Flows are exported when they go idle (no packets for `idle_timeout` seconds) or reach the active timeout, whichever comes first.
+
+```
+netflow enable <collector-ip> [<port>] [ingress|egress|both]  # enable exporter (default: port 2055, ingress)
+netflow disable                          # disable and free flow table RAM
+netflow direction <ingress|egress|both>  # change direction while enabled
+netflow collector <ip> [<port>]          # change collector without full disable/enable
+netflow timeout idle <seconds>           # idle flow timeout (default 60 s)
+netflow timeout active <seconds>         # active flow timeout (default 300 s)
+netflow show                             # print active flow table
+netflow status                           # show configuration and statistics
+```
+
+The flow table is allocated only while NetFlow is enabled (8 KB on ESP32, 4 KB on ESP32-C3). Configuration is persisted in NVS (`nf_dir` key stores the direction bitmask). The NetFlow section in the Monitoring page provides the same settings through the web interface.
+
+Compatible collectors include **ntopng**, **nfdump/nfcapd**, **pmacct**, **Grafana Alloy**, and any other tool that accepts NetFlow v5 UDP datagrams.
 
 ---
 
@@ -576,6 +610,14 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 | `syslog enable <server> [<port>]` | Enable syslog forwarding |
 | `syslog disable` | Disable syslog forwarding |
 | `syslog status` | Show syslog configuration |
+| `netflow enable <ip> [<port>] [ingress\|egress\|both]` | Enable NetFlow v5 exporter (default port 2055, direction ingress) |
+| `netflow disable` | Disable NetFlow exporter |
+| `netflow direction <ingress\|egress\|both>` | Change capture direction while enabled |
+| `netflow collector <ip> [<port>]` | Change collector IP/port |
+| `netflow timeout idle <seconds>` | Set idle flow timeout |
+| `netflow timeout active <seconds>` | Set active flow timeout |
+| `netflow show` | Print active flow table |
+| `netflow status` | Show configuration and flow statistics |
 
 ### MQTT / Home Assistant
 

@@ -183,6 +183,7 @@ font-size: 0.8rem;\
 <a href='/config' class='nav-button'>⚙️ Configuration</a>"
 /* Mappings button streamed conditionally here */
 #define INDEX_CHUNK_BUTTONS_CLOSE "\
+<a href='/monitoring' class='nav-button'>📊 Monitoring</a>\
 <a href='/firewall' class='nav-button'>🛡️ Firewall</a>\
 <a href='/vpn' class='nav-button'>🔒 VPN</a>\
 </div>"

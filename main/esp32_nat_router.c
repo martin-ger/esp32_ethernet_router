@@ -69,6 +69,7 @@
 #include "pcap_capture.h"
 #include "remote_console.h"
 #include "syslog_client.h"
+#include "netflow.h"
 #include "led_strip_status.h"
 #ifdef CONFIG_MDNS_ENABLED
 #include "mdns.h"
@@ -421,6 +422,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
         // Re-resolve syslog server now that network is up
         syslog_notify_connected();
+
+        // Open NetFlow UDP socket now that network is up
+        netflow_notify_connected();
 
         // Start VPN connection if enabled
         if (vpn_enabled) {
@@ -1013,6 +1017,9 @@ void app_main(void)
 
     // Initialize syslog client (UDP forwarding, disabled by default)
     syslog_init();
+
+    // Initialize NetFlow v5 exporter (disabled by default)
+    netflow_init();
 
 
     initialize_console();

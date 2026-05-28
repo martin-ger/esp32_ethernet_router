@@ -53,6 +53,7 @@
 extern uint8_t web_ui_get_bind(void);
 extern void    web_ui_set_bind(uint8_t bind);
 #include "syslog_client.h"
+#include "netflow.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
 #include "iperf.h"
@@ -94,6 +95,7 @@ static void register_w5500(void);
 static void register_acl(void);
 static void register_remote_console_cmd(void);
 static void register_syslog_cmd(void);
+static void register_netflow_cmd(void);
 #ifdef CONFIG_IDF_TARGET_ESP32C3
 #endif
 static void register_scan(void);
@@ -305,6 +307,7 @@ void register_router(void)
 #endif
     register_remote_console_cmd();
     register_syslog_cmd();
+    register_netflow_cmd();
     register_set_tz();
     register_set_vpn();
     register_wol();
@@ -3020,6 +3023,164 @@ static void register_syslog_cmd(void)
                 "  syslog disable                   - Disable syslog forwarding",
         .hint = " <action> [<args>]",
         .func = &syslog_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+static const char *nf_dirs_str(uint8_t dirs)
+{
+    if ((dirs & (NF_DIR_INGRESS | NF_DIR_EGRESS)) == (NF_DIR_INGRESS | NF_DIR_EGRESS)) return "ingress+egress";
+    if (dirs & NF_DIR_INGRESS) return "ingress";
+    if (dirs & NF_DIR_EGRESS)  return "egress";
+    return "none";
+}
+
+static int netflow_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: netflow <action> [args]\n");
+        printf("  status                              - Show NetFlow configuration\n");
+        printf("  enable <ip> [<port>] [ingress|egress|both]  - Enable exporter\n");
+        printf("  disable                             - Disable exporter\n");
+        printf("  direction <ingress|egress|both>     - Change capture direction\n");
+        printf("  collector <ip> [<port>]             - Change collector (keeps state)\n");
+        printf("  timeout idle <seconds>              - Set idle flow timeout\n");
+        printf("  timeout active <seconds>            - Set active flow timeout\n");
+        printf("  show                                - Print active flow table\n");
+        return 0;
+    }
+
+    const char *action = argv[1];
+
+    if (strcmp(action, "status") == 0) {
+        bool enabled;
+        char ip[16];
+        uint16_t port;
+        uint32_t idle_s, active_s;
+        uint8_t dirs;
+        netflow_get_config(&enabled, ip, sizeof(ip), &port, &idle_s, &active_s, &dirs);
+        printf("NetFlow Status:\n");
+        printf("===============\n");
+        printf("Enabled:        %s\n", enabled ? "yes" : "no");
+        printf("Direction:      %s\n", nf_dirs_str(dirs));
+        printf("Collector:      %s\n", ip[0] ? ip : "(not set)");
+        printf("Port:           %u\n", port);
+        printf("Idle timeout:   %lu s\n", (unsigned long)idle_s);
+        printf("Active timeout: %lu s\n", (unsigned long)active_s);
+        printf("Active flows:   %lu\n", (unsigned long)netflow_get_active_flows());
+        printf("Exported total: %lu\n", (unsigned long)netflow_get_exported_flows());
+
+    } else if (strcmp(action, "enable") == 0) {
+        if (argc < 3) {
+            printf("Usage: netflow enable <collector-ip> [<port>] [ingress|egress|both]\n");
+            return 1;
+        }
+        uint16_t port = 0;
+        uint8_t dirs = NF_DIR_INGRESS;  /* default */
+        /* Parse optional port and/or direction (order-independent after ip) */
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "ingress") == 0)      dirs = NF_DIR_INGRESS;
+            else if (strcmp(argv[i], "egress") == 0)  dirs = NF_DIR_EGRESS;
+            else if (strcmp(argv[i], "both") == 0)    dirs = NF_DIR_INGRESS | NF_DIR_EGRESS;
+            else {
+                int p = atoi(argv[i]);
+                if (p >= 1 && p <= 65535) port = (uint16_t)p;
+                else { printf("Invalid argument: %s\n", argv[i]); return 1; }
+            }
+        }
+        esp_err_t err = netflow_enable(argv[2], port, dirs);
+        if (err == ESP_OK) {
+            printf("NetFlow enabled → %s:%u (%s)\n", argv[2], port ? port : 2055, nf_dirs_str(dirs));
+        } else {
+            printf("Error: %s\n", esp_err_to_name(err));
+        }
+
+    } else if (strcmp(action, "disable") == 0) {
+        netflow_disable();
+        printf("NetFlow disabled.\n");
+
+    } else if (strcmp(action, "direction") == 0) {
+        if (argc < 3) {
+            printf("Usage: netflow direction <ingress|egress|both>\n");
+            return 1;
+        }
+        uint8_t dirs = 0;
+        if (strcmp(argv[2], "ingress") == 0)      dirs = NF_DIR_INGRESS;
+        else if (strcmp(argv[2], "egress") == 0)  dirs = NF_DIR_EGRESS;
+        else if (strcmp(argv[2], "both") == 0)    dirs = NF_DIR_INGRESS | NF_DIR_EGRESS;
+        else { printf("Unknown direction: %s (use ingress, egress, or both)\n", argv[2]); return 1; }
+
+        esp_err_t err = netflow_set_directions(dirs);
+        if (err == ESP_OK) {
+            printf("Direction set to %s\n", nf_dirs_str(dirs));
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            printf("NetFlow is disabled — enable it first\n");
+        } else {
+            printf("Error: %s\n", esp_err_to_name(err));
+        }
+
+    } else if (strcmp(action, "collector") == 0) {
+        if (argc < 3) {
+            printf("Usage: netflow collector <ip> [<port>]\n");
+            return 1;
+        }
+        uint16_t port = 0;
+        if (argc >= 4) {
+            int p = atoi(argv[3]);
+            if (p < 1 || p > 65535) { printf("Invalid port (1-65535)\n"); return 1; }
+            port = (uint16_t)p;
+        }
+        bool was_enabled = netflow_is_enabled();
+        uint8_t dirs;
+        netflow_get_config(NULL, NULL, 0, NULL, NULL, NULL, &dirs);
+        if (dirs == 0) dirs = NF_DIR_INGRESS;
+        netflow_enable(argv[2], port, dirs);
+        if (!was_enabled) netflow_disable();
+        printf("Collector set to %s:%u\n", argv[2], port ? port : 2055);
+
+    } else if (strcmp(action, "timeout") == 0) {
+        if (argc < 4) {
+            printf("Usage: netflow timeout <idle|active> <seconds>\n");
+            return 1;
+        }
+        int s = atoi(argv[3]);
+        if (s <= 0) { printf("Timeout must be > 0\n"); return 1; }
+        if (strcmp(argv[2], "idle") == 0) {
+            netflow_set_timeouts((uint32_t)s, 0);
+            printf("Idle timeout set to %d s\n", s);
+        } else if (strcmp(argv[2], "active") == 0) {
+            netflow_set_timeouts(0, (uint32_t)s);
+            printf("Active timeout set to %d s\n", s);
+        } else {
+            printf("Unknown timeout type: %s (use idle or active)\n", argv[2]);
+            return 1;
+        }
+
+    } else if (strcmp(action, "show") == 0) {
+        netflow_print_flows();
+
+    } else {
+        printf("Unknown action: %s\n", action);
+        return 1;
+    }
+    return 0;
+}
+
+static void register_netflow_cmd(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "netflow",
+        .help = "Manage NetFlow v5 flow exporter\n"
+                "  netflow status                              - Show configuration and stats\n"
+                "  netflow enable <ip> [<port>] [ingress|egress|both]  - Enable exporter\n"
+                "  netflow disable                             - Disable exporter\n"
+                "  netflow direction <ingress|egress|both>     - Change capture direction\n"
+                "  netflow collector <ip> [<port>]             - Change collector IP/port\n"
+                "  netflow timeout idle <s>                    - Set idle timeout\n"
+                "  netflow timeout active <s>                  - Set active timeout\n"
+                "  netflow show                                - Print active flows",
+        .hint = " <action> [<args>]",
+        .func = &netflow_cmd,
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }

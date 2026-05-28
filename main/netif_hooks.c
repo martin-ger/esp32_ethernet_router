@@ -22,6 +22,7 @@
 #include "acl.h"
 #include "client_stats.h"
 #include "pcap_capture.h"
+#include "netflow.h"
 #include "router_config.h"
 #include "wifi_config.h"
 #include "vpn_config.h"
@@ -543,6 +544,9 @@ static IRAM_ATTR err_t dl_netif_input_hook(struct pbuf *p, struct netif *netif) 
         }
     }
 
+    // NetFlow v5: account for this packet in the flow table (ingress direction)
+    netflow_account(p, NF_DIR_INGRESS);
+
     // Capture packet based on mode and ACL monitor flag (downlink interface = true)
     if (pcap_should_capture(is_acl_monitored, true)) {
         pcap_capture_packet(p);
@@ -588,6 +592,9 @@ static IRAM_ATTR err_t dl_netif_linkoutput_hook(struct netif *netif, struct pbuf
             entry->packets_sent++;
         }
     }
+
+    // NetFlow v5: account for this packet in the flow table (egress direction)
+    netflow_account(p, NF_DIR_EGRESS);
 
     // Capture packet based on mode and ACL monitor flag (downlink interface = true)
     if (pcap_should_capture(is_acl_monitored, true)) {
