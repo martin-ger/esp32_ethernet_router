@@ -720,7 +720,7 @@ char* html_escape(const char* src) {
     int esc_len = len + 1;
 
     for (int i = 0; i < len; i++) {
-        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';') {
+        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';' || src[i] == '<' || src[i] == '>') {
             //Will be replaced with a 5 char sequence
             esc_len += 4;
         }
@@ -734,7 +734,7 @@ char* html_escape(const char* src) {
 
     int j = 0;
     for (int i = 0; i < len; i++) {
-        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';') {
+        if (src[i] == '\\' || src[i] == '\'' || src[i] == '\"' || src[i] == '&' || src[i] == '#' || src[i] == ';' || src[i] == '<' || src[i] == '>') {
             res[j++] = '&';
             res[j++] = '#';
             res[j++] = '0' + (src[i] / 10);
@@ -3054,7 +3054,9 @@ static void dns_server_task(void *pvParameters)
         socklen_t client_len = sizeof(client);
         int len = recvfrom(sock, buf, sizeof(buf), 0,
                            (struct sockaddr *)&client, &client_len);
-        if (len < 12) continue;
+        // Reject queries too short to be valid, or too long to leave room
+        // for the 16-byte A record we append below.
+        if (len < 12 || len > (int)sizeof(buf) - 16) continue;
 
         // Turn query into response
         buf[2] = 0x81;  // QR=1, AA=1, RD=1
