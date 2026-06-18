@@ -19,6 +19,9 @@ td:first-child { color: #888; font-size: 0.9rem; padding-right: 0.75rem; width: 
 input[type='text'], input[type='number'], input[type='password'] { width: 100%; background: rgba(16, 32, 16, 0.6); border: 1px solid rgba(0, 230, 118, 0.2); border-radius: 8px; color: #e0e0e0; padding: 0.75rem; font-size: 0.95rem; }\
 input[type='text']:focus, input[type='number']:focus, input[type='password']:focus, select:focus { outline: none; border-color: #00e676; box-shadow: 0 0 0 3px rgba(0, 230, 118, 0.1); background: rgba(16, 32, 16, 0.8); }\
 input::placeholder { color: #666; }\
+textarea { width: 100%; background: rgba(16, 32, 16, 0.6); border: 1px solid rgba(0, 230, 118, 0.2); border-radius: 8px; color: #e0e0e0; padding: 0.75rem; font-size: 0.85rem; font-family: monospace; resize: vertical; }\
+textarea:focus { outline: none; border-color: #00e676; box-shadow: 0 0 0 3px rgba(0, 230, 118, 0.1); }\
+textarea::placeholder { color: #666; }\
 select { width: 100%; background: rgba(16, 32, 16, 0.6); border: 1px solid rgba(0, 230, 118, 0.2); border-radius: 8px; color: #e0e0e0; padding: 0.75rem; font-size: 0.95rem; cursor: pointer; -webkit-appearance: none; -moz-appearance: none; appearance: none; background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%2300e676' stroke-width='1.5' fill='none'/%3E%3C/svg%3E\"); background-repeat: no-repeat; background-position: right 0.75rem center; padding-right: 2rem; }\
 select option { background: #0a1f0a; color: #e0e0e0; }\
 .ok-button { border: none; border-radius: 8px; padding: 0.75rem 1.5rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; width: 100%; margin-top: 0.5rem; background: linear-gradient(135deg, #43a047 0%, #2e7d32 100%); color: #fff; box-shadow: 0 4px 15px rgba(67, 160, 71, 0.4); }\
@@ -50,6 +53,26 @@ setTimeout(\"location.href = '/'\", 10000);\
 }\
 </script>"
 
+/* Import section - paste a standard WireGuard .conf */
+#define VPN_CHUNK_IMPORT "\
+<h2>Import Config</h2>\
+<p style='color:#888; font-size:0.85rem; margin-bottom:0.5rem;'>Paste a WireGuard .conf. The fields below are filled and the device reboots.</p>\
+<textarea id='wgconf' rows='9' placeholder='[Interface]&#10;PrivateKey = ...&#10;Address = 10.2.0.2/32&#10;DNS = 10.2.0.1&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = host:51820&#10;AllowedIPs = 0.0.0.0/0'></textarea>\
+<button type='button' class='ok-button' onclick='importWg()'>Import &amp; Reboot</button>\
+<div id='wgmsg' style='margin-top:0.5rem; font-size:0.9rem;'></div>\
+<script>\
+function importWg(){\
+var t=document.getElementById('wgconf').value;\
+var m=document.getElementById('wgmsg');\
+if(!t.trim()){m.style.color='#ff5252';m.textContent='Paste a config first.';return;}\
+m.style.color='#00e676';m.textContent='Importing...';\
+fetch('/api/vpn-import',{method:'POST',body:t}).then(function(r){return r.json();}).then(function(d){\
+if(d.ok){m.style.color='#4caf50';m.textContent=d.msg;setTimeout(function(){location.href='/';},10000);}\
+else{m.style.color='#ff5252';m.textContent=d.msg||'Import failed';}\
+}).catch(function(){m.style.color='#ff5252';m.textContent='Request failed';});\
+}\
+</script>"
+
 /* VPN form - static wrapper (no format strings) */
 #define VPN_CHUNK_FORM_OPEN "\
 <h2>Configuration</h2>\
@@ -59,7 +82,10 @@ setTimeout(\"location.href = '/'\", 10000);\
 #define VPN_CHUNK_FORM_CLOSE "\
 <tr><td></td><td><input type='submit' value='Save &amp; Reboot' class='ok-button'/></td></tr>\
 </table>\
-</form>\
+</form>"
+
+/* Page footer - emitted after the import section */
+#define VPN_CHUNK_PAGE_END "\
 <div style='margin-top: 1.5rem; text-align: center;'>\
 <a href='/' style='padding: 0.6rem 1.5rem; background: linear-gradient(135deg, #43a047 0%, #2e7d32 100%); color: #fff; border: none; border-radius: 8px; text-decoration: none; font-size: 0.9rem; font-weight: 600;'>Home</a>\
 </div>\

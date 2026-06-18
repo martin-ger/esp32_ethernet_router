@@ -111,6 +111,7 @@ char* vpn_preshared_key = NULL;
 char* vpn_endpoint = NULL;
 char* vpn_address = NULL;
 char* vpn_netmask = NULL;
+char* vpn_dns = NULL;
 bool vpn_connected = false;
 uint32_t vpn_tunnel_ip = 0;         // Cached VPN tunnel IP (network byte order)
 int32_t vpn_killswitch = 1;         // Kill switch default on
@@ -124,6 +125,17 @@ static EventGroupHandle_t wifi_event_group;
 const int WIFI_CONNECTED_BIT = BIT0;
 
 #define DEFAULT_DNS "8.8.8.8"
+
+/* Effective DNS for downlink (ETH) clients: VPN DNS (while VPN enabled)
+ * overrides the manual ap_dns override, which in turn overrides the
+ * upstream-supplied DNS. Returns NULL when neither override is set so
+ * callers fall back to upstream. */
+static const char* effective_ap_dns(void)
+{
+    if (vpn_enabled && vpn_dns && vpn_dns[0]) return vpn_dns;
+    if (ap_dns && ap_dns[0]) return ap_dns;
+    return NULL;
+}
 
 
 /* Global vars */
@@ -405,13 +417,16 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         delete_portmap_tab();
         apply_portmap_tab();
 
-        // Copy DNS from WiFi STA to Ethernet downlink
-        if (!(ap_dns && ap_dns[0])) {
-            if (esp_netif_get_dns_info(wifiSTA, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK)
-            {
-                esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dns);
-                ESP_LOGI(TAG, "set dns to:" IPSTR, IP2STR(&(dns.ip.u_addr.ip4)));
-            }
+        // Copy DNS from WiFi STA to Ethernet downlink (or use the effective override: VPN DNS / ap_dns)
+        const char *eff_dns = effective_ap_dns();
+        if (eff_dns) {
+            dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(eff_dns);
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dns);
+            ESP_LOGI(TAG, "ETH DNS set to %s", eff_dns);
+        } else if (esp_netif_get_dns_info(wifiSTA, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
+            esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dns);
+            ESP_LOGI(TAG, "set dns to:" IPSTR, IP2STR(&(dns.ip.u_addr.ip4)));
         }
 
         // Initialize byte counter after getting IP (interface is ready)
@@ -583,7 +598,8 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
         esp_netif_dhcps_option(ethNetif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, &dhcps_dns_value, sizeof(dhcps_dns_value));
 
         // DNS server for DHCP clients
-        const char *dns_src = (ap_dns && ap_dns[0]) ? ap_dns : "1.1.1.1";
+        const char *eff_dns = effective_ap_dns();
+        const char *dns_src = eff_dns ? eff_dns : "1.1.1.1";
         dnsserver.ip.u_addr.ip4.addr = esp_ip4addr_aton(dns_src);
         dnsserver.ip.type = ESP_IPADDR_TYPE_V4;
         esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dnsserver);
@@ -614,7 +630,8 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
         esp_netif_set_ip_info(wifiSTA, &ipInfo_sta);
         // No DHCP → set DNS explicitly; DHCP path gets DNS from the upstream AP
         esp_netif_dns_info_t static_dns = {};
-        const char *dns_str = (ap_dns && ap_dns[0]) ? ap_dns : DEFAULT_DNS;
+        const char *eff_dns = effective_ap_dns();
+        const char *dns_str = eff_dns ? eff_dns : DEFAULT_DNS;
         static_dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(dns_str);
         static_dns.ip.type = ESP_IPADDR_TYPE_V4;
         esp_netif_set_dns_info(wifiSTA, ESP_NETIF_DNS_MAIN, &static_dns);
@@ -911,6 +928,8 @@ void app_main(void)
     if (vpn_address == NULL) vpn_address = param_set_default("");
     get_config_param_str("vpn_mask", &vpn_netmask);
     if (vpn_netmask == NULL) vpn_netmask = param_set_default("255.255.255.0");
+    get_config_param_str("vpn_dns", &vpn_dns);
+    if (vpn_dns == NULL) vpn_dns = param_set_default("");
     int vpn_ka_setting = 0;
     if (get_config_param_int("vpn_ka", &vpn_ka_setting) == ESP_OK) {
         vpn_keepalive = (int32_t)vpn_ka_setting;

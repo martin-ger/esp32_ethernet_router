@@ -564,6 +564,59 @@ static httpd_uri_t config_importp = {
     .handler   = config_import_handler,
 };
 
+/* --- WireGuard .conf import handler --- */
+
+static esp_err_t vpn_import_handler(httpd_req_t *req)
+{
+    if (is_web_password_set() && !is_authenticated(req)) {
+        { char _ip[16]; ESP_LOGW(TAG, "Unauthenticated access to /api/vpn-import from %s", get_client_ip(req, _ip, sizeof(_ip))); }
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not authenticated");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len == 0 || req->content_len > 4096) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Invalid body size\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char *body = malloc(req->content_len + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+
+    int total = 0;
+    while (total < req->content_len) {
+        int ret = httpd_req_recv(req, body + total, req->content_len - total);
+        if (ret <= 0) {
+            free(body);
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) httpd_resp_send_408(req);
+            return ESP_FAIL;
+        }
+        total += ret;
+    }
+    body[total] = '\0';
+
+    esp_err_t err = vpn_import_conf(body);
+    free(body);
+
+    httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK) {
+        httpd_resp_send(req, "{\"ok\":true,\"msg\":\"WireGuard config imported. Rebooting...\"}", HTTPD_RESP_USE_STRLEN);
+        esp_timer_start_once(restart_timer, 3000000);
+    } else {
+        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Import failed: need PrivateKey, PublicKey, Endpoint and Address\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    return ESP_OK;
+}
+
+static httpd_uri_t vpn_importp = {
+    .uri       = "/api/vpn-import",
+    .method    = HTTP_POST,
+    .handler   = vpn_import_handler,
+};
+
 /* --- OTA Firmware Upload handler --- */
 
 static esp_err_t ota_upload_handler(httpd_req_t *req)
@@ -2621,6 +2674,10 @@ static esp_err_t vpn_get_handler(httpd_req_t *req)
                         preprocess_string(param);
                         nvs_set_str(nvs, "vpn_mask", param);
                     }
+                    if (httpd_query_key_value(buf, "vpn_dns", param, sizeof(param)) == ESP_OK) {
+                        preprocess_string(param);
+                        nvs_set_str(nvs, "vpn_dns", param);
+                    }
                     if (httpd_query_key_value(buf, "vpn_ka", param, sizeof(param)) == ESP_OK) {
                         nvs_set_i32(nvs, "vpn_ka", atoi(param));
                     }
@@ -2732,12 +2789,20 @@ static esp_err_t vpn_get_handler(httpd_req_t *req)
         "<tr><td>Endpoint</td><td><input type='text' name='vpn_endpoint' value='%s' placeholder='Host or IP'/></td></tr>"
         "<tr><td>Port</td><td><input type='number' name='vpn_port' value='%d' min='1' max='65535'/></td></tr>"
         "<tr><td>Tunnel IP</td><td><input type='text' name='vpn_ip' value='%s' placeholder='e.g. 10.0.0.2'/></td></tr>"
-        "<tr><td>Netmask</td><td><input type='text' name='vpn_mask' value='%s' placeholder='255.255.255.0'/></td></tr>"
-        "<tr><td>Keepalive (sec)</td><td><input type='number' name='vpn_ka' value='%d' min='0' max='65535'/></td></tr>",
+        "<tr><td>Netmask</td><td><input type='text' name='vpn_mask' value='%s' placeholder='255.255.255.0'/></td></tr>",
         vpn_endpoint ? vpn_endpoint : "",
         (int)vpn_port,
         vpn_address ? vpn_address : "",
-        vpn_netmask ? vpn_netmask : "255.255.255.0",
+        vpn_netmask ? vpn_netmask : "255.255.255.0");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>DNS</td><td><input type='text' name='vpn_dns' value='%s' placeholder='Optional, e.g. 10.2.0.1'/></td></tr>",
+        vpn_dns ? vpn_dns : "");
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Keepalive (sec)</td><td><input type='number' name='vpn_ka' value='%d' min='0' max='65535'/></td></tr>",
         (int)vpn_keepalive);
     httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
 
@@ -2756,6 +2821,12 @@ static esp_err_t vpn_get_handler(httpd_req_t *req)
     httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
 
     httpd_resp_send_chunk(req, VPN_CHUNK_FORM_CLOSE, HTTPD_RESP_USE_STRLEN);
+
+    /* Import section (paste a standard WireGuard .conf) - after the config fields */
+    httpd_resp_send_chunk(req, VPN_CHUNK_IMPORT, HTTPD_RESP_USE_STRLEN);
+
+    /* Page footer (Home button + close tags) */
+    httpd_resp_send_chunk(req, VPN_CHUNK_PAGE_END, HTTPD_RESP_USE_STRLEN);
 
     /* End chunked response */
     httpd_resp_send_chunk(req, NULL, 0);
@@ -2969,7 +3040,7 @@ httpd_handle_t start_webserver(uint16_t port)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.stack_size = 16384;  // Large stack needed for mappings page with 3x 2KB HTML buffers
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 15;
     config.max_uri_len = 1024;
     config.open_fn = http_open_fn;
 
@@ -2999,6 +3070,7 @@ httpd_handle_t start_webserver(uint16_t port)
         httpd_register_uri_handler(server, &favicon_uri);
         httpd_register_uri_handler(server, &config_exportp);
         httpd_register_uri_handler(server, &config_importp);
+        httpd_register_uri_handler(server, &vpn_importp);
         httpd_register_uri_handler(server, &ota_uploadp);
 
         // Start captive portal DNS only when no upstream WiFi is configured
