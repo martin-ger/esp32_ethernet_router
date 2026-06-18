@@ -429,6 +429,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "set dns to:" IPSTR, IP2STR(&(dns.ip.u_addr.ip4)));
         }
 
+        // esp_netif just (re)set netif_default to the STA uplink on this
+        // GOT_IP. If the VPN is up in route-all mode, restore the tunnel as the
+        // default route so forwarded traffic keeps going through WireGuard
+        // across DHCP lease renewals and STA reconnects.
+        vpn_reassert_default_route();
+
         // Initialize byte counter after getting IP (interface is ready)
         init_byte_counter();
 
@@ -459,6 +465,10 @@ static void eth_downlink_event_handler(void* arg, esp_event_base_t event_base,
             eth_link_up = true;
             // Install downlink netif hooks once Ethernet link is active
             init_downlink_netif_hooks();
+            // The downlink coming up makes esp_netif recompute netif_default
+            // (the STA uplink wins on route_prio). Restore the VPN tunnel as the
+            // default route if route-all mode is active.
+            vpn_reassert_default_route();
         } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
             ESP_LOGI(TAG, "Ethernet downlink: link down");
             eth_link_up = false;
