@@ -72,6 +72,7 @@ static void register_set_ap_ip(void);
 static void register_set_ap_dns(void);
 static void register_set_eth_nat(void);
 static void register_set_eth_dhcps(void);
+static void register_set_eth_dhcpc(void);
 static void register_show(void);
 static void register_portmap(void);
 static void register_dhcp_reserve(void);
@@ -399,6 +400,7 @@ void register_router(void)
     register_set_ap_dns();
     register_set_eth_nat();
     register_set_eth_dhcps();
+    register_set_eth_dhcpc();
     register_set_hostname();
     register_dhcp_reserve();
     register_portmap();
@@ -889,6 +891,61 @@ static void register_set_eth_dhcps(void)
         .hint = NULL,
         .func = &set_eth_dhcps,
         .argtable = &set_eth_dhcps_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_eth_dhcpc' command */
+static struct {
+    struct arg_str *mode;
+    struct arg_end *end;
+} set_eth_dhcpc_arg;
+
+static int set_eth_dhcpc(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &set_eth_dhcpc_arg);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_eth_dhcpc_arg.end, argv[0]);
+        return 1;
+    }
+
+    const char *mode = set_eth_dhcpc_arg.mode->sval[0];
+    int val;
+    if (strcasecmp(mode, "on") == 0 || strcmp(mode, "1") == 0) {
+        val = 1;
+    } else if (strcasecmp(mode, "off") == 0 || strcmp(mode, "0") == 0) {
+        val = 0;
+    } else {
+        printf("Usage: set_eth_dhcpc <on|off>\n");
+        return 1;
+    }
+
+    esp_err_t err = set_config_param_int("eth_dhcpc", val);
+    if (err == ESP_OK) {
+        eth_dhcpc_enabled = val;
+        if (val) {
+            printf("Ethernet uplink (DHCP client) mode enabled.\n");
+            printf("  - DHCP server on Ethernet is forced OFF.\n");
+            printf("  - Ethernet becomes the default route (home gateway).\n");
+        } else {
+            printf("Ethernet uplink (DHCP client) mode disabled (static IP).\n");
+        }
+        printf("Restart to apply.\n");
+    }
+    return err;
+}
+
+static void register_set_eth_dhcpc(void)
+{
+    set_eth_dhcpc_arg.mode = arg_str1(NULL, NULL, "<on|off>", "Enable or disable Ethernet DHCP client (uplink) mode");
+    set_eth_dhcpc_arg.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_eth_dhcpc",
+        .help = "Ethernet uplink mode: get IP via DHCP from upstream router (forces DHCP server off, Ethernet becomes default route; default: off)",
+        .hint = NULL,
+        .func = &set_eth_dhcpc,
+        .argtable = &set_eth_dhcpc_arg
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
@@ -1545,10 +1602,15 @@ static int show(int argc, char **argv)
         }
         printf("  Hostname: %s\n", hostname);
 
-        printf("\nEthernet Downlink Settings:\n");
+        printf("\nEthernet %s Settings:\n", eth_dhcpc_enabled ? "Uplink" : "Downlink");
         ip4_addr_t addr;
         addr.addr = my_ap_ip;
-        printf("  IP Address: " IPSTR "\n", IP2STR(&addr));
+        printf("  IP Mode: %s\n", eth_dhcpc_enabled ? "DHCP client (uplink)" : "static");
+        if (eth_dhcpc_enabled && my_ap_ip == 0) {
+            printf("  IP Address: (awaiting DHCP)\n");
+        } else {
+            printf("  IP Address: " IPSTR "\n", IP2STR(&addr));
+        }
         printf("  DNS Server: %s\n", (ap_dns && ap_dns[0]) ? ap_dns : "(upstream)");
         printf("  NAT: %s\n", eth_nat_enabled ? "enabled" : "disabled (routed)");
         printf("  DHCP Server: %s\n", eth_dhcps_enabled ? "enabled" : "disabled");

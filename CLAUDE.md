@@ -76,7 +76,7 @@ components/
 ├── netflow/             # NetFlow v5 exporter: flow table, UDP export, ingress/egress direction bitmask
 ├── pcap_capture/        # PCAP packet capture with TCP streaming to Wireshark
 ├── remote_console/      # Network-accessible CLI via TCP (password protected)
-├── cmd_router/          # CLI commands: set_sta, set_ap_ip, set_ap_dns, set_eth_nat, set_eth_dhcps, portmap, dhcp_reserve, web_ui, set_router_password, show, acl, remote_console, syslog, netflow
+├── cmd_router/          # CLI commands: set_sta, set_ap_ip, set_ap_dns, set_eth_nat, set_eth_dhcps, set_eth_dhcpc, portmap, dhcp_reserve, web_ui, set_router_password, show, acl, remote_console, syslog, netflow
 └── cmd_system/          # System commands: free, heap, restart, factory_reset, tasks
 ```
 
@@ -123,6 +123,7 @@ Both NAT and DHCP server on the Ethernet interface are runtime-configurable and 
 ```c
 extern uint8_t eth_nat_enabled;    // 1=NAT active, 0=routed mode
 extern uint8_t eth_dhcps_enabled;  // 1=DHCP server active, 0=disabled
+extern uint8_t eth_dhcpc_enabled;  // 1=Ethernet uplink/DHCP-client mode, 0=static IP (default)
 ```
 
 **Behavior:**
@@ -135,6 +136,24 @@ extern uint8_t eth_dhcps_enabled;  // 1=DHCP server active, 0=disabled
 **NVS keys** (namespace `esp32_nat`):
 - `eth_nat` (int) - NAT enabled flag (default 1)
 - `eth_dhcps` (int) - DHCP server enabled flag (default 1)
+- `eth_dhcpc` (int) - Ethernet DHCP client (uplink) mode flag (default 0)
+
+### Ethernet Uplink / DHCP-Client Mode
+A special mode (CLI-only, `set_eth_dhcpc on`) inverts the Ethernet role: instead of a static
+downlink LAN, the Ethernet port becomes a **DHCP client** that obtains its IP/gateway/DNS from an
+upstream router. Intended for topologies where the WiFi STA connects to an isolated device AP (e.g. an
+OBD2 dongle) and the Ethernet faces the main home network.
+
+**Behavior when `eth_dhcpc_enabled=1`:**
+- Ethernet netif is created with `ESP_NETIF_DHCP_CLIENT` (DHCP client auto-starts on link-up via the
+  esp_eth glue); the static `ap_ip` is ignored.
+- `eth_dhcps_enabled` is **forced to 0** at boot — DHCP server and client are mutually exclusive on the
+  same interface (this also hides the DHCP-dependent `/mappings` sections).
+- Ethernet `route_prio` is raised to **110** (above the WiFi STA's 100) so the upstream gateway becomes
+  the device's default route.
+- NAT (if `eth_nat_enabled`) is (re)applied in the `IP_EVENT_ETH_GOT_IP` handler using the DHCP-assigned
+  address, since `my_ap_ip` is unknown at boot. NAPT still masquerades Ethernet→STA traffic to the STA IP.
+- Applied at netif creation time (requires reboot to change).
 
 ### DHCP Reservations
 The custom DHCP server supports IP reservations - assigning fixed IPs to specific MAC addresses.
@@ -331,6 +350,7 @@ set_ap_ip <ip>                                   # Set IP for the Ethernet downl
 set_ap_dns <dns>                                 # Set DNS server for Ethernet clients
 set_eth_nat <on|off>                             # Enable/disable NAT on Ethernet (requires restart)
 set_eth_dhcps <on|off>                           # Enable/disable DHCP server on Ethernet (requires restart)
+set_eth_dhcpc <on|off>                            # Ethernet uplink mode: get IP via DHCP from upstream router; forces DHCP server off, ETH becomes default route (requires restart)
 portmap add TCP <ext_port> <int_ip> <int_port>   # Add port mapping (only when NAT enabled)
 portmap del TCP <ext_port>                       # Delete port mapping
 dhcp_reserve add <mac> <ip> [-n <name>]          # Add DHCP reservation (only when DHCP server enabled)

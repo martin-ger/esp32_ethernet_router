@@ -52,6 +52,10 @@ extern uint8_t eth_nat_enabled;
 // Ethernet DHCP server (1 = enabled (default), 0 = disabled)
 extern uint8_t eth_dhcps_enabled;
 
+// Ethernet uplink / DHCP client mode (1 = DHCP client, 0 = static IP (default)).
+// Mutually exclusive with eth_dhcps_enabled; when set, the DHCP server is forced off.
+extern uint8_t eth_dhcpc_enabled;
+
 // Ethernet link state (true = link up, false = link down)
 extern bool eth_link_up;
 

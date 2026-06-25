@@ -155,6 +155,7 @@ struct dhcp_reservation_entry dhcp_reservations[MAX_DHCP_RESERVATIONS];
 
 uint8_t eth_nat_enabled = 1;  // NAT enabled by default
 uint8_t eth_dhcps_enabled = 1;  // DHCP server enabled by default
+uint8_t eth_dhcpc_enabled = 0;  // Ethernet DHCP client (uplink) mode, off by default
 bool eth_link_up = false;  // Ethernet link state
 
 esp_netif_t* wifiSTA;
@@ -417,16 +418,19 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         delete_portmap_tab();
         apply_portmap_tab();
 
-        // Copy DNS from WiFi STA to Ethernet downlink (or use the effective override: VPN DNS / ap_dns)
-        const char *eff_dns = effective_ap_dns();
-        if (eff_dns) {
-            dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(eff_dns);
-            dns.ip.type = ESP_IPADDR_TYPE_V4;
-            esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dns);
-            ESP_LOGI(TAG, "ETH DNS set to %s", eff_dns);
-        } else if (esp_netif_get_dns_info(wifiSTA, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
-            esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dns);
-            ESP_LOGI(TAG, "set dns to:" IPSTR, IP2STR(&(dns.ip.u_addr.ip4)));
+        // Copy DNS from WiFi STA to Ethernet downlink (or use the effective override: VPN DNS / ap_dns).
+        // Only meaningful when the Ethernet DHCP server hands DNS to LAN clients; skip in DHCP-client mode.
+        if (eth_dhcps_enabled) {
+            const char *eff_dns = effective_ap_dns();
+            if (eff_dns) {
+                dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(eff_dns);
+                dns.ip.type = ESP_IPADDR_TYPE_V4;
+                esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dns);
+                ESP_LOGI(TAG, "ETH DNS set to %s", eff_dns);
+            } else if (esp_netif_get_dns_info(wifiSTA, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
+                esp_netif_set_dns_info(ethNetif, ESP_NETIF_DNS_MAIN, &dns);
+                ESP_LOGI(TAG, "set dns to:" IPSTR, IP2STR(&(dns.ip.u_addr.ip4)));
+            }
         }
 
         // esp_netif just (re)set netif_default to the STA uplink on this
@@ -475,6 +479,21 @@ static void eth_downlink_event_handler(void* arg, esp_event_base_t event_base,
         } else if (event_id == ETHERNET_EVENT_START) {
             ESP_LOGI(TAG, "Ethernet downlink: started");
         }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
+        // Only reached in Ethernet uplink (DHCP client) mode. The DHCP-assigned
+        // address is the NAT (input-side) interface address, so re-apply NAPT here
+        // since my_ap_ip is unknown at boot.
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        my_ap_ip = event->ip_info.ip.addr;
+        ESP_LOGI(TAG, "Ethernet got ip:" IPSTR " gw:" IPSTR,
+                 IP2STR(&event->ip_info.ip), IP2STR(&event->ip_info.gw));
+        if (eth_nat_enabled) {
+            ip_napt_enable(my_ap_ip, 1);
+            ESP_LOGI(TAG, "NAT (re)enabled on Ethernet " IPSTR, IP2STR(&event->ip_info.ip));
+        }
+        // Ethernet just (re)became the default route via route_prio; re-assert the
+        // VPN tunnel as default if route-all mode is active.
+        vpn_reassert_default_route();
     }
 }
 
@@ -582,25 +601,46 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     }
 #endif
 
-    // Configure Ethernet netif with static IP (and optionally DHCP server)
-    my_ap_ip = esp_ip4addr_aton(ap_ip);
-    esp_netif_ip_info_t eth_ip_info = {
-        .ip.addr = my_ap_ip,
-        .gw.addr = my_ap_ip,
-    };
-    esp_netif_set_ip4_addr(&eth_ip_info.netmask, 255, 255, 255, 0);
+    // Configure Ethernet netif. Default: static IP (and optionally DHCP server).
+    // Special "Ethernet uplink" mode (eth_dhcpc_enabled): DHCP client, no server,
+    // and a higher route priority so the Ethernet gateway becomes the default route.
+    esp_netif_ip_info_t eth_ip_info = { 0 };
+    if (eth_dhcpc_enabled) {
+        // DHCP client mode: IP/gw/DNS are learned from the upstream router.
+        // Leave eth_ip_info zeroed; DHCP overwrites it. my_ap_ip is set later in
+        // the IP_EVENT_ETH_GOT_IP handler once a lease arrives.
+        my_ap_ip = 0;
+    } else {
+        my_ap_ip = esp_ip4addr_aton(ap_ip);
+        eth_ip_info.ip.addr = my_ap_ip;
+        eth_ip_info.gw.addr = my_ap_ip;
+        esp_netif_set_ip4_addr(&eth_ip_info.netmask, 255, 255, 255, 0);
+    }
 
-    esp_netif_inherent_config_t eth_base_cfg = {
-        .flags = (eth_dhcps_enabled ? ESP_NETIF_DHCP_SERVER : 0) | ESP_NETIF_FLAG_AUTOUP,
-        .ip_info = &eth_ip_info,
-        .if_key = "ETH_DEF",
-        .if_desc = "eth",
-        .route_prio = 10,
-    };
+    // Start from the IDF Ethernet inherent defaults and override only what differs.
+    // This inherits get_ip_event/lost_ip_event (IP_EVENT_ETH_GOT_IP / _ETH_LOST_IP),
+    // if_key and if_desc. Hand-rolling this struct previously omitted get_ip_event,
+    // which then defaulted to 0 == IP_EVENT_STA_GOT_IP, so in DHCP-client mode the
+    // Ethernet lease was delivered to the STA handler instead of the ETH handler.
+    esp_netif_inherent_config_t eth_base_cfg = ESP_NETIF_INHERENT_DEFAULT_ETH();
+    // The default sets the DHCP-client flag; pick the DHCP role for our three modes
+    // (uplink/DHCP-client, downlink/DHCP-server, or static with neither).
+    eth_base_cfg.flags = (esp_netif_flags_t)(
+        (eth_base_cfg.flags & ~(ESP_NETIF_DHCP_CLIENT | ESP_NETIF_DHCP_SERVER))
+        | (eth_dhcpc_enabled ? ESP_NETIF_DHCP_CLIENT
+                             : (eth_dhcps_enabled ? ESP_NETIF_DHCP_SERVER : 0)));
+    eth_base_cfg.ip_info = &eth_ip_info;
+    // In DHCP-client (uplink) mode, outrank the WiFi STA (route_prio 100) so the
+    // home router's gateway wins netif_default; otherwise stay a low-priority downlink.
+    eth_base_cfg.route_prio = eth_dhcpc_enabled ? 110 : 10;
     esp_netif_config_t eth_netif_cfg = ESP_NETIF_DEFAULT_ETH();
     eth_netif_cfg.base = &eth_base_cfg;
     ethNetif = esp_netif_new(&eth_netif_cfg);
     esp_netif_attach(ethNetif, esp_eth_new_netif_glue(eth_handle));
+
+    if (eth_dhcpc_enabled) {
+        ESP_LOGI(TAG, "Ethernet uplink (DHCP client) mode enabled");
+    }
 
     if (eth_dhcps_enabled) {
         // Enable DNS (offer) for DHCP server
@@ -620,6 +660,8 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
 
     // Register ETH downlink events
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_downlink_event_handler, NULL));
+    // In Ethernet uplink (DHCP client) mode we also need the GOT_IP event to apply NAT/routing
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_downlink_event_handler, NULL));
 
     // --- WiFi STA uplink ---
     wifiSTA = esp_netif_create_default_wifi_sta();
@@ -843,6 +885,16 @@ void app_main(void)
         int dhcps_val = 1;
         get_config_param_int("eth_dhcps", &dhcps_val);
         eth_dhcps_enabled = (dhcps_val != 0) ? 1 : 0;
+    }
+    {
+        int dhcpc_val = 0;
+        get_config_param_int("eth_dhcpc", &dhcpc_val);
+        eth_dhcpc_enabled = (dhcpc_val != 0) ? 1 : 0;
+    }
+    // DHCP client and DHCP server cannot coexist on the Ethernet netif.
+    // When the Ethernet uplink (DHCP client) mode is active, force the server off.
+    if (eth_dhcpc_enabled) {
+        eth_dhcps_enabled = 0;
     }
     get_config_param_str("hostname", &hostname);
     if (hostname == NULL || hostname[0] == '\0') {

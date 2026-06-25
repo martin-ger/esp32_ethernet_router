@@ -218,6 +218,7 @@ set_ap_ip <ip>
 set_ap_dns <dns>
 set_eth_nat <on|off>
 set_eth_dhcps <on|off>
+set_eth_dhcpc <on|off>
 ```
 
 The Ethernet interface defaults to `192.168.4.1/24` with NAT and DHCP server enabled. Changes to NAT or DHCP server state take effect after reboot.
@@ -225,6 +226,14 @@ The Ethernet interface defaults to `192.168.4.1/24` with NAT and DHCP server ena
 When NAT is disabled, the Ethernet segment is routed — clients use their own IP addresses, and the router forwards packets to the default gateway (WiFi uplink or VPN tunnel).
 
 When DHCP server is disabled, clients must be configured with static IPs in the `192.168.4.x` range (or whatever subnet you set).
+
+#### Ethernet Uplink / DHCP-Client Mode
+
+`set_eth_dhcpc on` inverts the Ethernet role: instead of a static LAN downlink, the Ethernet port becomes a **DHCP client** that obtains its IP, gateway, and DNS from an upstream router. This is for topologies where the WiFi STA connects to an isolated device AP and the Ethernet port faces the main home network.
+
+When enabled, the DHCP server is forced off (server and client are mutually exclusive on one interface), the Ethernet interface becomes the device's default route, and NAT (if enabled) masquerades Ethernet→STA traffic to the STA's IP. The mode is off by default and takes effect after reboot.
+
+For home clients to reach a device behind the WiFi STA, the home router still needs a static route for that subnet pointing at the ESP32's Ethernet IP; give the ESP32 a DHCP reservation on the home router so the next-hop stays stable.
 
 ### DHCP Reservations
 
@@ -535,6 +544,7 @@ Connect via serial at 115200 bps, or via the remote console.
 | `set_ap_dns <dns>` | Set DNS server for Ethernet clients |
 | `set_eth_nat <on\|off>` | Enable or disable NAT (requires reboot) |
 | `set_eth_dhcps <on\|off>` | Enable or disable DHCP server (requires reboot) |
+| `set_eth_dhcpc <on\|off>` | Ethernet uplink mode: get IP via DHCP from upstream router; forces DHCP server off, Ethernet becomes default route (requires reboot) |
 | `set_hostname <name>` | Set DHCP hostname |
 | `set_ttl <value>` | Override TTL in forwarded packets |
 | `ping <host>` | Send ICMP echo requests |
