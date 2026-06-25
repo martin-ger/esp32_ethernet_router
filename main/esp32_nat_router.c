@@ -625,10 +625,15 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     esp_netif_inherent_config_t eth_base_cfg = ESP_NETIF_INHERENT_DEFAULT_ETH();
     // The default sets the DHCP-client flag; pick the DHCP role for our three modes
     // (uplink/DHCP-client, downlink/DHCP-server, or static with neither).
+    // Downlink modes need ESP_NETIF_FLAG_AUTOUP so the netif is brought up at start
+    // time and the lwIP DHCP server actually starts handing out leases; the default
+    // ETH inherent config lacks AUTOUP (it relies on link-up to bring the netif up,
+    // which is fine for the DHCP-client/uplink path but not for the server).
     eth_base_cfg.flags = (esp_netif_flags_t)(
         (eth_base_cfg.flags & ~(ESP_NETIF_DHCP_CLIENT | ESP_NETIF_DHCP_SERVER))
         | (eth_dhcpc_enabled ? ESP_NETIF_DHCP_CLIENT
-                             : (eth_dhcps_enabled ? ESP_NETIF_DHCP_SERVER : 0)));
+                             : ((eth_dhcps_enabled ? ESP_NETIF_DHCP_SERVER : 0)
+                                | ESP_NETIF_FLAG_AUTOUP)));
     eth_base_cfg.ip_info = &eth_ip_info;
     // In DHCP-client (uplink) mode, outrank the WiFi STA (route_prio 100) so the
     // home router's gateway wins netif_default; otherwise stay a low-priority downlink.
