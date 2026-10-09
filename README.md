@@ -401,27 +401,58 @@ The router includes a WireGuard client that establishes a tunnel over the WiFi u
 ### Configuration (CLI)
 
 ```
-set_vpn private_key <base64 key>
-set_vpn public_key <base64 key>
-set_vpn preshared_key <base64 key>
-set_vpn endpoint <host>
-set_vpn port <udp_port>
-set_vpn address <tunnel_ip>
-set_vpn netmask <netmask>
-set_vpn keepalive <seconds>
-set_vpn mtu <1280-1420>
-set_vpn killswitch <on|off>
-set_vpn route_all <on|off>
-set_vpn <on|off>
+set_vpn <private_key> <public_key> <endpoint> <tunnel_ip> [-k <preshared_key>] [-m <netmask>]
+        [-p <udp_port>] [-a <keepalive_s>] [-M <mtu>] [-d <dns_ip>] [-e <0|1>] [-K <0|1>] [-R <0|1>]
+```
+
+| Argument | Meaning |
+|----------|---------|
+| `<private_key>` | This device's WireGuard private key (base64) |
+| `<public_key>` | Peer public key (base64) |
+| `<endpoint>` | Peer host name or IP (resolved each time the tunnel starts) |
+| `<tunnel_ip>` | This device's address inside the tunnel, e.g. `10.0.0.2` |
+| `-k` | Preshared key (base64, optional) |
+| `-m` | Tunnel netmask (default `255.255.255.0`) |
+| `-p` | Peer UDP port (default `51820`) |
+| `-a` | Persistent keepalive in seconds (`0` = off) |
+| `-M` | Tunnel MTU, 1280-1420 (default 1420; lower for CGNAT/PPPoE/LTE uplinks) |
+| `-d` | DNS server handed to Ethernet clients while the VPN is up |
+| `-e` | `1` enable, `0` disable the tunnel |
+| `-K` | Kill switch `1`/`0` (default on) |
+| `-R` | Route all traffic through the tunnel `1`, split tunnel `0` |
+
+The first four arguments are positional and must be given in this order, so changing e.g. only the endpoint means repeating the private and public key before it. The options are independent: only the ones you give are changed. Settings are stored in NVS and applied after `restart`; `show vpn` keeps showing the running values until then.
+
+Example (full setup, then enable):
+
+```
+set_vpn <private_key> <public_key> vpn.example.org 10.0.0.2 -k <preshared_key> -p 51820
+set_vpn -a 25 -e 1 -K 0 -R 0
+restart
 ```
 
 ### Options
 
-**Kill switch** (`killswitch on`): blocks Ethernet client Internet traffic when the VPN tunnel is down, preventing unprotected traffic from leaking through the plain WiFi uplink.
+**Kill switch** (`-K 1`): blocks Ethernet client Internet traffic when the VPN tunnel is down, preventing unprotected traffic from leaking through the plain WiFi uplink.
 
-**Route all** (`route_all on`): sends all client traffic through the VPN tunnel. When disabled (split-tunnel), only traffic destined for the VPN peer subnet is routed through the tunnel; all other traffic uses the WiFi uplink directly.
+**Route all** (`-R 1`): sends all client traffic through the VPN tunnel. When disabled (split-tunnel), only traffic destined for the VPN peer subnet is routed through the tunnel; all other traffic uses the WiFi uplink directly.
 
 VPN status (connected / disconnected) is shown on the index page when a tunnel is configured.
+
+### Reaching a device on the Ethernet segment from the VPN peer
+
+The tunnel also works in the other direction: the VPN peer can reach hosts on the Ethernet segment (for example to print to a network printer on TCP 9100) with plain IP routing, no proxy involved. Requirements:
+
+1. **Routed Ethernet:** `set_eth_nat off` and `restart`. See the note below.
+2. **Gateway on the device:** the Ethernet device needs a static IP in the Ethernet subnet and the router's Ethernet IP (default `192.168.4.1`) as its default gateway, so replies come back through the router and into the tunnel.
+3. **Route on the VPN server:** add the Ethernet subnet to the router's peer `AllowedIPs`, e.g. `AllowedIPs = 10.0.0.2/32, 192.168.4.0/24`. With `wg-quick` this also creates the route on the server.
+4. The tunnel, Ethernet and WiFi subnets must not overlap.
+
+Optionally use split tunnel (`set_vpn -R 0 -K 0`) so the router's own traffic stays on the WiFi uplink.
+
+Test from the VPN server: `ping 192.168.4.10` and, for a printer, `echo test > /dev/tcp/192.168.4.10/9100`.
+
+> **Note:** with NAT enabled on the Ethernet interface, an ICMP echo from the peer reached the Ethernet device but TCP connections to it did not establish; after `set_eth_nat off` both worked. The cause was not confirmed with a packet capture.
 
 ---
 
@@ -613,18 +644,19 @@ Lists: `to_esp`, `from_esp`, `from_eth`, `to_eth`
 
 | Command | Description |
 |---------|-------------|
-| `set_vpn <on\|off>` | Enable or disable VPN tunnel |
-| `set_vpn private_key <key>` | WireGuard private key (base64) |
-| `set_vpn public_key <key>` | Peer public key (base64) |
-| `set_vpn preshared_key <key>` | Preshared key (base64, optional) |
-| `set_vpn endpoint <host>` | Peer endpoint address |
-| `set_vpn port <port>` | Peer UDP port (default 51820) |
-| `set_vpn address <ip>` | Tunnel IP address |
-| `set_vpn netmask <mask>` | Tunnel subnet mask |
-| `set_vpn keepalive <seconds>` | Persistent keepalive interval |
-| `set_vpn mtu <1280-1420>` | Tunnel MTU (default 1420; lower for CGNAT/PPPoE/LTE uplinks) |
-| `set_vpn killswitch <on\|off>` | Block traffic when VPN is down |
-| `set_vpn route_all <on\|off>` | Route all traffic through VPN |
+| `set_vpn <private_key> <public_key> <endpoint> <tunnel_ip>` | Private key, peer public key, peer host/IP and tunnel address (positional, in this order, base64 keys) |
+| `set_vpn ... -k <preshared_key>` | Preshared key (base64, optional) |
+| `set_vpn ... -m <netmask>` | Tunnel netmask (default 255.255.255.0) |
+| `set_vpn ... -p <port>` | Peer UDP port (default 51820) |
+| `set_vpn ... -a <seconds>` | Persistent keepalive interval (0 = off) |
+| `set_vpn ... -M <1280-1420>` | Tunnel MTU (default 1420; lower for CGNAT/PPPoE/LTE uplinks) |
+| `set_vpn ... -d <dns_ip>` | DNS server for Ethernet clients while the VPN is up |
+| `set_vpn ... -e <0\|1>` | Enable or disable VPN tunnel |
+| `set_vpn ... -K <0\|1>` | Kill switch: block traffic when VPN is down |
+| `set_vpn ... -R <0\|1>` | Route all traffic through VPN (0 = split tunnel) |
+| `show vpn` | Tunnel status (peer up / handshake pending / disabled) |
+
+Changes are applied after `restart`; see [WireGuard VPN](#wireguard-vpn) for details.
 
 ### Diagnosis
 
