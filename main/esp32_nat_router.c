@@ -547,6 +547,10 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
 
     eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(CONFIG_ETH_SPI_HOST, &devcfg);
     w5500_config.int_gpio_num = CONFIG_ETH_SPI_INT_GPIO;
+#if CONFIG_ETH_SPI_INT_GPIO < 0
+    // No INT line wired: the driver requires poll_period_ms > 0 in this case
+    w5500_config.poll_period_ms = CONFIG_ETH_SPI_POLL_MS;
+#endif
     // Use custom SPI driver with pre-allocated DMA-aligned TX+RX buffers,
     // eliminating per-frame heap allocation that caused DMA exhaustion crashes.
     w5500_spi_driver_config(&w5500_config.custom_spi_driver, &w5500_config);
@@ -558,7 +562,7 @@ void router_init(const uint8_t* mac, const char* ssid, const char* ent_username,
     esp_eth_mac_t *eth_mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
 
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
-    phy_config.reset_gpio_num = CONFIG_ETH_SPI_RST_GPIO;   // GPIO2 drives W5500 RST
+    phy_config.reset_gpio_num = CONFIG_ETH_SPI_RST_GPIO;   // W5500 RST line (-1: software reset only)
     esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_config);
 
 #else
