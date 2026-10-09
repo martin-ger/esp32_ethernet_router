@@ -133,6 +133,7 @@ idf.py -B build_w5500_c3 -p /dev/ttyUSB0 flash monitor   # DevKit-M-1 (UART)
 ### Notes
 
 - You may adapt the settings via `menuconfig` or directly in sdkconfig.defaults.w5500_c3 to adapt for other ESP32 types and boards with a W5500.
+- If the W5500 INT and/or RST lines are not connected to the SoC, set `CONFIG_ETH_SPI_INT_GPIO=-1` (the driver then polls the chip every `CONFIG_ETH_SPI_POLL_MS`, default 2 ms) and/or `CONFIG_ETH_SPI_RST_GPIO=-1` (software reset only).
 - The W5500 draws up to 250 mA, way to much for the SuperMini's internal 3.3V voltage regulator. Use an external power supply for the W5500.
 - The W5500 module has no factory MAC address. The firmware derives one automatically from the ESP32-C3's base MAC.
 - The onboard LED on the SuperMini (typically GPIO 8) can be configured via `set_led_gpio 8`.
