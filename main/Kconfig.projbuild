@@ -71,8 +71,18 @@ menu "Ethernet Downlink"
         depends on ETH_DOWNLINK_W5500
 
     config ETH_SPI_INT_GPIO
-        int "W5500 INT GPIO"
+        int "W5500 INT GPIO (-1 for polling mode)"
         default 3
+        depends on ETH_DOWNLINK_W5500
+        help
+            -1 selects polling mode: the driver checks the W5500 every
+            ETH_SPI_POLL_MS instead of waiting for the INT pin. Use it on
+            boards where the INT line is not wired to the SoC.
+
+    config ETH_SPI_POLL_MS
+        int "W5500 polling period in ms (used when INT GPIO is -1)"
+        default 2
+        range 1 100
         depends on ETH_DOWNLINK_W5500
 
     config ETH_SPI_RST_GPIO
