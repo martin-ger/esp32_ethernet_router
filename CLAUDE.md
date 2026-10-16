@@ -9,8 +9,9 @@ ESP32 Ethernet Router - Firmware where **WiFi STA is the uplink** (Internet) and
 **Supported hardware variants:**
 - **WT32-ETH01** — ESP32 (dual-core, 240 MHz) with built-in LAN8720 Ethernet PHY
 - **W5500 + ESP32-C3 SuperMini** — ESP32-C3 (single-core RISC-V, 160 MHz) with W5500 SPI Ethernet module
+- **W5500 + ESP32-S3 (YelloByte YB-ESP32-S3-ETH)** — ESP32-S3 (dual-core, 240 MHz) with the on-board W5500; INT/RST optional (polling / software reset)
 
-Both variants share all router logic. The only divergence is Ethernet MAC/PHY initialization, selected at build time via Kconfig (`CONFIG_ETH_DOWNLINK_EMAC` vs `CONFIG_ETH_DOWNLINK_W5500`).
+All variants share the router logic. The only divergence is Ethernet MAC/PHY initialization, selected at build time via Kconfig (`CONFIG_ETH_DOWNLINK_EMAC` vs `CONFIG_ETH_DOWNLINK_W5500`).
 
 ## Build Commands
 
@@ -32,6 +33,13 @@ idf.py -B build_w5500_c3 \
   build
 idf.py -B build_w5500_c3 -p /dev/ttyACM0 flash monitor   # SuperMini (USB-JTAG)
 idf.py -B build_w5500_c3 -p /dev/ttyUSB0 flash monitor   # DevKit-M-1 (UART)
+```
+
+### W5500 + ESP32-S3
+```bash
+./build_firmware_w5500_s3.sh      # Clean build → firmware_w5500_s3/
+idf.py -B build_w5500_s3   -D SDKCONFIG=sdkconfig.w5500_s3   -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_s3"   set-target esp32s3            # first time only; -B/-D go before the command
+idf.py -B build_w5500_s3 -D SDKCONFIG=sdkconfig.w5500_s3   -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_s3"   -p <PORT> flash monitor       # USB-C → CH343 UART, 115200 bps
 ```
 
 **Note:** Each variant uses a separate build directory and sdkconfig file to avoid conflicts. Always pass `-D SDKCONFIG=sdkconfig.w5500_c3` for the W5500 build or it will overwrite the default `sdkconfig`.

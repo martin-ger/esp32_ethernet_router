@@ -142,6 +142,51 @@ idf.py -B build_w5500_c3 -p /dev/ttyUSB0 flash monitor   # DevKit-M-1 (UART)
 
 ---
 
+## Hardware — W5500 + ESP32-S3
+
+The same W5500 downlink also runs on an **ESP32-S3**. It was developed on the **[YelloByte YB-ESP32-S3-ETH](https://github.com/yellobyte/YB-ESP32-S3-ETH)** (ESP32-S3-WROOM-1U + W5500, USB-C via a CH343 UART bridge), whose W5500 is hardwired to the SoC.
+
+| Parameter | Value |
+|-----------|-------|
+| SoC | ESP32-S3 (dual-core Xtensa, 240 MHz) |
+| Flash | 4 MB assumed by the shared partition table (modules with more flash work as is) |
+| Ethernet | W5500 (SPI, 10/100 Mbit/s) |
+| Console | UART0 via the on-board CH343 (`COMx` / `/dev/ttyACM*`), 115200 bps |
+
+### Wiring (YB-ESP32-S3-ETH)
+
+| W5500 Pin | ESP32-S3 GPIO | Note |
+|-----------|---------------|------|
+| MOSI | GPIO 11 | hardwired |
+| MISO | GPIO 13 | hardwired |
+| SCLK | GPIO 12 | hardwired |
+| SCS (CS) | GPIO 14 | hardwired |
+| INT | GPIO 18 | only if the INT solder bridge on the bottom is closed (open by default) |
+| RST | GPIO 21 | only if the RST solder bridge on the bottom is closed (open by default) |
+
+With the bridges open (factory state) the shipped `sdkconfig.defaults.w5500_s3` uses `INT = -1` (the driver polls the W5500 every 2 ms) and `RST = -1` (software reset), so the board works without any hardware modification. After closing the bridges set `CONFIG_ETH_SPI_INT_GPIO=18` and `CONFIG_ETH_SPI_RST_GPIO=21`. The board's `IO47` LED can be used as status LED (`set_led_gpio 47`).
+
+### Build
+
+```bash
+. $IDF_PATH/export.sh
+./build_firmware_w5500_s3.sh
+```
+
+or manually (global options such as `-B`/`-D` go before the `idf.py` command):
+
+```bash
+idf.py -B build_w5500_s3   -D SDKCONFIG=sdkconfig.w5500_s3   -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_s3"   set-target esp32s3
+idf.py -B build_w5500_s3   -D SDKCONFIG=sdkconfig.w5500_s3   -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_s3"   -p <PORT> flash monitor
+```
+
+### Notes
+
+- `sdkconfig.defaults.w5500_s3` raises the event loop task (`sys_evt`) stack to 6 KB: the default 2304 bytes overflow in the got-IP handler (which starts SNTP and WireGuard) and the board boot-loops once the VPN is enabled.
+- The ESP32-S3 flashes the bootloader at `0x0000`, like the C3.
+
+---
+
 ## Web Interface
 
 Access the web interface from any device connected to the Ethernet LAN. The default address is `http://192.168.4.1`.
@@ -745,6 +790,19 @@ The script performs a clean build and copies the four binary files into the `fir
 idf.py -B build_w5500_c3 menuconfig
 ```
 
+### W5500 + ESP32-S3
+
+```bash
+. $IDF_PATH/export.sh
+./build_firmware_w5500_s3.sh
+```
+
+The script performs a clean build and copies the four binary files into the `firmware_w5500_s3/` directory. To reconfigure build options:
+
+```bash
+idf.py -B build_w5500_s3 menuconfig
+```
+
 ### Configuration files
 
 | File | Purpose |
@@ -752,8 +810,9 @@ idf.py -B build_w5500_c3 menuconfig
 | `sdkconfig.defaults` | Shared base config (IP forwarding, NAPT, DHCP server, flash-size savings) |
 | `sdkconfig.defaults.wt32_eth_sta_uplink` | WT32-ETH01 Ethernet PHY GPIOs (LAN8720) |
 | `sdkconfig.defaults.w5500_c3` | W5500 SPI pins, ESP32-C3 specifics, IRAM/perf tuning |
+| `sdkconfig.defaults.w5500_s3` | W5500 SPI pins (YB-ESP32-S3-ETH), ESP32-S3 specifics, IRAM/perf tuning |
 
-Each variant uses a separate sdkconfig file (`sdkconfig` vs `sdkconfig.w5500_c3`) so both can coexist in the same project directory.
+Each variant uses a separate sdkconfig file (`sdkconfig` vs `sdkconfig.w5500_c3` vs `sdkconfig.w5500_s3`) so all can coexist in the same project directory.
 
 Both images must fit the 1536 KB OTA app slot; the C3 build is the tighter one. To save flash, the base config uses silent assertions (no file/expression strings) and disables the error-name table, so `esp_err_to_name()` and log messages show numeric error codes (e.g. `0x101` instead of `ESP_ERR_NO_MEM`). Setup and event-handling sources in `main/` are compiled with `-Os`; `netif_hooks.c` stays on `-O2` because it is on the packet path. Note that `sdkconfig.defaults` only fills in values missing from an existing `sdkconfig` — delete the generated sdkconfig file (or the affected lines) to pick up changed defaults.
 
@@ -801,6 +860,20 @@ To wipe the entire flash:
 
 ```bash
 esptool.py --chip esp32c3 --port /dev/ttyACM0 erase_flash
+```
+
+### W5500 + ESP32-S3
+
+Flash the binaries from the `firmware_w5500_s3/` directory:
+
+```bash
+esptool.py --chip esp32s3 --port <PORT> --baud 460800 \n  write_flash \n  0x0000  firmware_w5500_s3/bootloader.bin \n  0x8000  firmware_w5500_s3/partition-table.bin \n  0xf000  firmware_w5500_s3/ota_data_initial.bin \n  0x20000 firmware_w5500_s3/esp32_eth_router.bin
+```
+
+To wipe the entire flash:
+
+```bash
+esptool.py --chip esp32s3 --port <PORT> erase_flash
 ```
 
 ### First Boot

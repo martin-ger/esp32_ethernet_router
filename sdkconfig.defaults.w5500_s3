@@ -1,0 +1,57 @@
+# W5500 SPI Ethernet + ESP32-S3
+#
+# Developed on the YelloByte YB-ESP32-S3-ETH (ESP32-S3-WROOM-1U + W5500),
+# where the W5500 is hardwired (https://github.com/yellobyte/YB-ESP32-S3-ETH):
+#   MOSI -> GPIO11   MISO -> GPIO13   SCLK -> GPIO12   SCS -> GPIO14
+#   INT  -> GPIO18   only if the INT solder bridge on the bottom is closed (open by default)
+#   RST  -> GPIO21   only if the RST solder bridge on the bottom is closed (open by default)
+# With both bridges open (factory state) INT=-1 selects driver polling and
+# RST=-1 a software reset. After closing the bridges set INT=18 / RST=21.
+#
+# Build:
+#   idf.py set-target esp32s3 -B build_w5500_s3 \
+#     -D SDKCONFIG=sdkconfig.w5500_s3 \
+#     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_s3" \
+#     build
+#
+# Flash/monitor (the board's USB-C goes to a CH343 UART bridge, console on UART0):
+#   idf.py -B build_w5500_s3 -p <PORT> flash monitor
+
+# Select W5500 downlink driver
+CONFIG_ETH_DOWNLINK_W5500=y
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
+
+# W5500 pin assignments (SPI2_HOST)
+CONFIG_ETH_SPI_HOST=1
+CONFIG_ETH_SPI_MISO_GPIO=13
+CONFIG_ETH_SPI_MOSI_GPIO=11
+CONFIG_ETH_SPI_SCLK_GPIO=12
+CONFIG_ETH_SPI_CS_GPIO=14
+CONFIG_ETH_SPI_INT_GPIO=-1
+CONFIG_ETH_SPI_POLL_MS=2
+CONFIG_ETH_SPI_RST_GPIO=-1
+
+# SPI clock: 27 lands on the 80/3 = 26.67 MHz divider
+CONFIG_ETH_SPI_CLOCK_MHZ=27
+
+# ESP32-S3 is dual core; run at full speed
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# SPI master + lwIP hot paths in IRAM
+CONFIG_SPI_MASTER_IN_IRAM=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+
+# Optimize for speed instead of size
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# CONFIG_COMPILER_OPTIMIZATION_SIZE is not set
+
+# The default event loop task (sys_evt) runs the STA got-IP handler, which starts
+# SNTP and the WireGuard tunnel; its 2304-byte default stack overflows on the S3
+# and the board boot-loops as soon as the VPN is enabled.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=6144
+
+# Flash size: the base config assumes 4 MB (partitions_example.csv). Modules with
+# more flash work as is; to use more, set CONFIG_ESPTOOLPY_FLASHSIZE_* and enlarge
+# the partition table.
