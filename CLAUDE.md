@@ -42,7 +42,7 @@ idf.py -B build_w5500_s3   -D SDKCONFIG=sdkconfig.w5500_s3   -D SDKCONFIG_DEFAUL
 idf.py -B build_w5500_s3 -D SDKCONFIG=sdkconfig.w5500_s3   -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.w5500_s3"   -p <PORT> flash monitor       # USB-C → CH343 UART, 115200 bps
 ```
 
-**Note:** Each variant uses a separate build directory and sdkconfig file to avoid conflicts. Always pass `-D SDKCONFIG=sdkconfig.w5500_c3` for the W5500 build or it will overwrite the default `sdkconfig`.
+**Note:** Each variant uses a separate build directory and sdkconfig file to avoid conflicts. Always pass `-D SDKCONFIG=sdkconfig.w5500_c3` (C3) or `-D SDKCONFIG=sdkconfig.w5500_s3` (S3) for the W5500 builds or they will overwrite the default `sdkconfig`.
 
 ## Architecture
 
@@ -363,6 +363,7 @@ These settings in `sdkconfig.defaults` are required:
 CONFIG_LWIP_IP_FORWARD=y    # Enable IP forwarding
 CONFIG_LWIP_IPV4_NAPT=y     # Enable NAT (code won't compile without this)
 CONFIG_LWIP_L2_TO_L3_COPY=y # LWIP layer support
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096  # sys_evt: ESP_LOG (full vfprintf) + syslog hook overflow the 2304 default
 ```
 
 ## Serial Console Commands

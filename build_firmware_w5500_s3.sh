@@ -27,7 +27,11 @@ rm -rf "$BUILD_DIR"
 
 # Build
 echo "--- Building ---"
-idf.py set-target esp32s3
+idf.py \
+    -B "$BUILD_DIR" \
+    -D SDKCONFIG="$SDKCONFIG" \
+    -D SDKCONFIG_DEFAULTS="$SDKCONFIG_DEFAULTS" \
+    set-target esp32s3
 idf.py \
     -B "$BUILD_DIR" \
     -D SDKCONFIG="$SDKCONFIG" \

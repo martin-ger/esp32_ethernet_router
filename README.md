@@ -182,7 +182,7 @@ idf.py -B build_w5500_s3   -D SDKCONFIG=sdkconfig.w5500_s3   -D SDKCONFIG_DEFAUL
 
 ### Notes
 
-- `sdkconfig.defaults.w5500_s3` raises the event loop task (`sys_evt`) stack to 6 KB: the default 2304 bytes overflow in the got-IP handler (which starts SNTP and WireGuard) and the board boot-loops once the VPN is enabled.
+- The shared `sdkconfig.defaults` raises the event loop task (`sys_evt`) stack to 4 KB for all variants: every `ESP_LOG` in an event handler runs the full newlib `vfprintf` (~800 bytes frame), plus the syslog hook's buffer when syslog is enabled, which overflowed the 2304-byte default on the S3 (`A stack overflow in task sys_evt has been detected`).
 - The ESP32-S3 flashes the bootloader at `0x0000`, like the C3.
 
 ---
@@ -867,7 +867,12 @@ esptool.py --chip esp32c3 --port /dev/ttyACM0 erase_flash
 Flash the binaries from the `firmware_w5500_s3/` directory:
 
 ```bash
-esptool.py --chip esp32s3 --port <PORT> --baud 460800 \n  write_flash \n  0x0000  firmware_w5500_s3/bootloader.bin \n  0x8000  firmware_w5500_s3/partition-table.bin \n  0xf000  firmware_w5500_s3/ota_data_initial.bin \n  0x20000 firmware_w5500_s3/esp32_eth_router.bin
+esptool.py --chip esp32s3 --port <PORT> --baud 460800 \
+  write_flash \
+  0x0000  firmware_w5500_s3/bootloader.bin \
+  0x8000  firmware_w5500_s3/partition-table.bin \
+  0xf000  firmware_w5500_s3/ota_data_initial.bin \
+  0x20000 firmware_w5500_s3/esp32_eth_router.bin
 ```
 
 To wipe the entire flash:
