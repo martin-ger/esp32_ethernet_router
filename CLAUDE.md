@@ -390,7 +390,7 @@ web_ui port <port>                               # Set web server port, default 
 show status                                      # Show router status (connection, IPs, memory)
 show config                                      # Show router configuration (WiFi/ETH settings)
 show mappings                                    # Show DHCP pool, reservations and port mappings
-show route                                       # Show routing table (interfaces, connected and default routes)
+show route                                       # Show routing table (interfaces, link state, connected and default routes; alias: show routes)
 factory_reset                                    # Erase all settings and restart (factory reset)
 acl show [<list>]                                # Show ACL rules and statistics
 acl add <list> <proto> <src> <sport> <dst> <dport> <action>  # Add ACL rule

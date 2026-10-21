@@ -1430,6 +1430,46 @@ static struct {
     struct arg_end *end;
 } show_args;
 
+/* Snapshot of the lwIP netif list for 'show route'. Taken on the tcpip thread
+ * (esp_netif_tcpip_exec) so it is consistent even without core locking, which
+ * is off in our sdkconfigs; printing happens afterwards in the console task. */
+#define ROUTE_SNAP_MAX 8
+
+typedef struct {
+    struct netif *nif;      // identity only (matched against sta/eth impl), never dereferenced later
+    char name[8];
+    ip4_addr_t ip, mask, gw;
+    bool up, link, is_default;
+} route_snap_t;
+
+typedef struct {
+    route_snap_t e[ROUTE_SNAP_MAX];
+    int n;
+} route_snap_list_t;
+
+static esp_err_t route_snapshot_cb(void *ctx)
+{
+    route_snap_list_t *l = (route_snap_list_t *)ctx;
+    struct netif *nif;
+
+    l->n = 0;
+    NETIF_FOREACH(nif) {
+        if (l->n >= ROUTE_SNAP_MAX) {
+            break;
+        }
+        route_snap_t *s = &l->e[l->n++];
+        s->nif = nif;
+        snprintf(s->name, sizeof(s->name), "%c%c%d", nif->name[0], nif->name[1], nif->num);
+        ip4_addr_copy(s->ip, *netif_ip4_addr(nif));
+        ip4_addr_copy(s->mask, *netif_ip4_netmask(nif));
+        ip4_addr_copy(s->gw, *netif_ip4_gw(nif));
+        s->up = netif_is_up(nif);
+        s->link = netif_is_link_up(nif);
+        s->is_default = (nif == netif_default);
+    }
+    return ESP_OK;
+}
+
 /* 'show' command implementation */
 static int show(int argc, char **argv)
 {
@@ -1444,7 +1484,7 @@ static int show(int argc, char **argv)
         printf("  status   - Show router status (connection, clients, memory)\n");
         printf("  config   - Show router configuration (STA/downlink settings)\n");
         printf("  mappings - Show DHCP pool, reservations and port mappings\n");
-        printf("  route    - Show routing table (interfaces, connected + default routes)\n");
+        printf("  route    - Show routing table (interfaces, connected + default routes; alias: routes)\n");
         printf("  acl      - Show firewall ACL rules\n");
         printf("  vpn      - Show WireGuard VPN status and config\n");
         return 1;
@@ -1752,7 +1792,7 @@ static int show(int argc, char **argv)
             printf("Image state: %s\n", state_str);
         }
 
-    } else if (strcmp(type, "route") == 0) {
+    } else if (strcmp(type, "route") == 0 || strcmp(type, "routes") == 0) {
         // Routing table. lwIP here has no general FIB: routing is each netif's
         // IP&netmask (its connected route) plus the single netif_default, whose
         // gateway is the default route. We walk the raw lwIP netif_list (not
@@ -1764,37 +1804,34 @@ static int show(int argc, char **argv)
         // esp_netif_get_handle_from_netif_impl() would hand back a bogus pointer
         // that crashes when dereferenced. Instead resolve the two known managed
         // handles up front and match by impl pointer; anything else is raw.
-        struct netif *def = netif_default;
-        ip4_addr_t def_gw = { 0 };
-        char def_name[8] = "?";
-        struct netif *nif;
+        static route_snap_list_t snap;  // ~400 bytes, keep off the console task stack
+        const route_snap_t *def = NULL;
+        const char *def_name = "?";
 
         esp_netif_t *sta_h = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         esp_netif_t *eth_h = esp_netif_get_handle_from_ifkey("ETH_DEF");
         struct netif *sta_if = sta_h ? (struct netif *)esp_netif_get_netif_impl(sta_h) : NULL;
         struct netif *eth_if = eth_h ? (struct netif *)esp_netif_get_netif_impl(eth_h) : NULL;
 
+        if (esp_netif_tcpip_exec(route_snapshot_cb, &snap) != ESP_OK) {
+            printf("Failed to read interface list\n");
+            return 1;
+        }
+
         printf("Routing Table:\n");
         printf("==============\n");
-        printf("%-10s %-15s %-15s %-15s %4s %-4s %s\n",
-               "Iface", "IP", "Netmask", "Gateway", "Prio", "Link", "Default");
+        printf("%-10s %-15s %-15s %-15s %4s %-14s %s\n",
+               "Iface", "IP", "Netmask", "Gateway", "Prio", "State", "Default");
 
-        NETIF_FOREACH(nif) {
-            ip4_addr_t ip = { .addr = netif_ip4_addr(nif)->addr };
-            ip4_addr_t mask = { .addr = netif_ip4_netmask(nif)->addr };
-            ip4_addr_t gw = { .addr = netif_ip4_gw(nif)->addr };
-            bool is_def = (nif == def);
-
-            esp_netif_t *eh = (nif == sta_if) ? sta_h : (nif == eth_if) ? eth_h : NULL;
+        const char *labels[ROUTE_SNAP_MAX];
+        for (int i = 0; i < snap.n; i++) {
+            const route_snap_t *s = &snap.e[i];
+            esp_netif_t *eh = (s->nif == sta_if) ? sta_h : (s->nif == eth_if) ? eth_h : NULL;
 
             // Prefer the esp_netif desc for managed netifs; fall back to the lwIP
             // name (e.g. "wg0", "lo0") for raw ones like the WireGuard tunnel.
-            char name[8];
-            snprintf(name, sizeof(name), "%c%c%d", nif->name[0], nif->name[1], nif->num);
-            const char *label = (eh != NULL) ? esp_netif_get_desc(eh) : name;
-            if (label == NULL) {
-                label = name;
-            }
+            const char *label = (eh != NULL) ? esp_netif_get_desc(eh) : NULL;
+            labels[i] = label ? label : s->name;
 
             char prio[6];
             if (eh != NULL) {
@@ -1803,43 +1840,42 @@ static int show(int argc, char **argv)
                 snprintf(prio, sizeof(prio), "-");
             }
 
-            if (is_def) {
-                def_gw.addr = gw.addr;
-                snprintf(def_name, sizeof(def_name), "%s", label);
+            if (s->is_default) {
+                def = s;
+                def_name = labels[i];
             }
 
             char ips[16], masks[16], gws[16];
-            snprintf(ips, sizeof(ips), IPSTR, IP2STR(&ip));
-            snprintf(masks, sizeof(masks), IPSTR, IP2STR(&mask));
-            snprintf(gws, sizeof(gws), IPSTR, IP2STR(&gw));
-            printf("%-10s %-15s %-15s %-15s %4s %-4s %s\n",
-                   label, ips, masks, gws, prio,
-                   netif_is_up(nif) ? "up" : "down",
-                   is_def ? "*" : "");
+            snprintf(ips, sizeof(ips), IPSTR, IP2STR(&s->ip));
+            snprintf(masks, sizeof(masks), IPSTR, IP2STR(&s->mask));
+            snprintf(gws, sizeof(gws), IPSTR, IP2STR(&s->gw));
+            printf("%-10s %-15s %-15s %-15s %4s %-4s%-10s %s\n",
+                   labels[i], ips, masks, gws, prio,
+                   s->up ? "up" : "down",
+                   s->link ? "" : " (no link)",
+                   s->is_default ? "*" : "");
+        }
+        if (snap.n == 0) {
+            printf("No interfaces\n");
         }
 
         // Derived view: connected routes (one per up netif with an address).
         printf("\nConnected routes:\n");
-        NETIF_FOREACH(nif) {
-            uint32_t addr = netif_ip4_addr(nif)->addr;
-            uint32_t nm = netif_ip4_netmask(nif)->addr;
-            if (!netif_is_up(nif) || addr == 0) {
+        for (int i = 0; i < snap.n; i++) {
+            const route_snap_t *s = &snap.e[i];
+            if (!s->up || ip4_addr_isany_val(s->ip)) {
                 continue;
             }
-            ip4_addr_t net = { .addr = addr & nm };
+            ip4_addr_t net = { .addr = s->ip.addr & s->mask.addr };
             int prefix = 0;
-            for (uint32_t m = lwip_ntohl(nm); m & 0x80000000u; m <<= 1) {
+            for (uint32_t m = lwip_ntohl(s->mask.addr); m & 0x80000000u; m <<= 1) {
                 prefix++;
             }
-            char name[8];
-            snprintf(name, sizeof(name), "%c%c%d", nif->name[0], nif->name[1], nif->num);
-            esp_netif_t *eh = (nif == sta_if) ? sta_h : (nif == eth_if) ? eth_h : NULL;
-            const char *label = (eh != NULL) ? esp_netif_get_desc(eh) : name;
-            printf("  " IPSTR "/%d dev %s\n", IP2STR(&net), prefix, label ? label : name);
+            printf("  " IPSTR "/%d dev %s\n", IP2STR(&net), prefix, labels[i]);
         }
 
         if (def != NULL) {
-            printf("Default route: via " IPSTR " dev %s\n", IP2STR(&def_gw), def_name);
+            printf("Default route: via " IPSTR " dev %s\n", IP2STR(&def->gw), def_name);
         } else {
             printf("Default route: none\n");
         }

@@ -654,7 +654,7 @@ Connect via serial at 115200 bps, or via the remote console.
 | Command | Description |
 |---------|-------------|
 | `show mappings` | DHCP pool, reservations, port maps |
-| `show route` | Routing table: interfaces, connected + default routes |
+| `show route` | Routing table: interfaces, link state, connected + default routes (alias: `show routes`) |
 | `dhcp_reserve add <mac> <ip> [-n <name>]` | Add DHCP reservation |
 | `dhcp_reserve del <mac>` | Remove DHCP reservation |
 | `dhcp_reserve isolate <mac\|name> <on\|off>` | Restrict a reserved client to Internet-only access (LAN isolation) |
