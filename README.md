@@ -1,10 +1,13 @@
 # ESP32 Ethernet Router
 
+For a focused first-boot and WT32-ETH01 flashing walkthrough, see the
+[WT32-ETH01 setup guide](docs/WT32-ETH01_SETUP.md).
+
 Firmware for the **[WT32-ETH01](https://github.com/egnor/wt32-eth01)** board (and boards with a W5500 ethernet module) that turns it into a compact network router. 
 
 **Derived from** [esp32_nat_router](https://github.com/martin-ger/esp32_nat_router). The original project uses WiFi as the downlink (AP) and (as one option) Ethernet as the uplink. This variant reverses that: **WiFi STA is the uplink** (Internet) and **Ethernet is the downlink** (LAN). If you are looking for a plain ESP32 **Ethernet AP** (Layer 2 bridge), check out [esp32_eth_wifi_bridge](https://github.com/martin-ger/esp32_eth_wifi_bridge).
 
-The board connects to an existing WiFi network as a client (STA) and shares that connection with wired devices through its Ethernet port. The Ethernet side runs its own IP subnet, an optional DHCP server, and optional NAT — so Ethernet clients need no special configuration and get transparent Internet access.
+The board connects to an existing WiFi network as a client (STA) and shares that connection with wired devices through its Ethernet port. On a factory-fresh boot, the Ethernet side automatically comes up as the onboarding AP at `192.168.4.1` with DHCP and the web configuration page, so no serial configuration is required. Enter the upstream WiFi credentials there and reboot; they are stored in NVS. After that, the Ethernet side runs its own IP subnet, an optional DHCP server, and optional NAT — so Ethernet clients need no special configuration and get transparent Internet access.
 
 <img src="https://raw.githubusercontent.com/martin-ger/esp32_ethernet_router/refs/heads/main/esp32_ethernet_router_topo.png">
 
@@ -782,6 +785,10 @@ Requires ESP-IDF v5.x. Source the ESP-IDF environment, then build for your targe
 
 ### WT32-ETH01 (ESP32 + LAN8720)
 
+On macOS or Linux, the repository includes a flash.sh helper that writes the
+prebuilt firmware and preserves NVS by default. See the WT32-ETH01 setup guide
+for usage and the explicit ERASE=1 recovery option.
+
 ```bash
 . $IDF_PATH/export.sh
 ./build_firmware.sh
@@ -899,13 +906,21 @@ esptool.py --chip esp32s3 --port <PORT> erase_flash
 
 ### First Boot
 
-After flashing either variant, connect via serial at 115200 bps and configure the upstream WiFi:
+After flashing either variant, the WT32-ETH01 / ESP32-ETH01 firmware starts its automatic Ethernet onboarding network when no upstream WiFi credentials are stored. Connect a computer to the Ethernet port with DHCP enabled and open:
+
+```
+http://192.168.4.1
+```
+
+The Ethernet AP uses `192.168.4.1/24`, runs DHCP, and redirects captive-portal requests to the configuration page. Enter the upstream WiFi SSID and password, save, and let the router reboot. The credentials are persisted in NVS and the next boot starts the WiFi STA uplink automatically.
+
+If Ethernet is unavailable, configure the upstream WiFi from the serial console at 115200 bps:
 
 ```
 set_sta MyWiFiSSID MyPassword
 ```
 
-The router will reboot and connect. Access the web interface at `http://192.168.4.1` (or `http://esp32-eth-router.local` via mDNS) from a device connected to the Ethernet port.
+After the router connects, access the web interface at `http://192.168.4.1` (or `http://esp32-eth-router.local` via mDNS) from a device connected to the Ethernet port.
 
 To erase all settings and return to defaults:
 
